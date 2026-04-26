@@ -1,10 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import type {
   SynapseConfig, Peer, Message, Thread, ThreadMode, ThreadCloseReason, AuditEntry,
   ThreadParticipant,
 } from './types.js';
+import { buildIdentityPaths } from './types.js';
+import { INIT_SCHEMA_SQL } from './schema.js';
 
 let db: DatabaseSync | null = null;
 
@@ -20,81 +22,7 @@ export function getDb(config: SynapseConfig): DatabaseSync {
 }
 
 function initSchema(d: DatabaseSync): void {
-  d.exec(`
-    CREATE TABLE IF NOT EXISTS peers (
-      id            TEXT PRIMARY KEY,
-      label         TEXT NOT NULL,
-      registered_at TEXT NOT NULL,
-      last_seen_at  TEXT NOT NULL,
-      capabilities  TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS messages (
-      id          TEXT PRIMARY KEY,
-      from_id     TEXT NOT NULL,
-      to_id       TEXT NOT NULL,
-      thread_id   TEXT NOT NULL,
-      parent_id   TEXT,
-      body        TEXT NOT NULL,
-      workspace   TEXT,
-      created_at  TEXT NOT NULL,
-      expires_at  TEXT NOT NULL,
-      read_at     TEXT
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_messages_to       ON messages(to_id, read_at);
-    CREATE INDEX IF NOT EXISTS idx_messages_thread   ON messages(thread_id, created_at);
-    CREATE INDEX IF NOT EXISTS idx_messages_expires  ON messages(expires_at);
-    CREATE INDEX IF NOT EXISTS idx_peers_last_seen   ON peers(last_seen_at);
-
-    CREATE TABLE IF NOT EXISTS threads (
-      thread_id           TEXT PRIMARY KEY,
-      mode_by_side        TEXT NOT NULL,         -- JSON: { peerId: "review"|"auto" }
-      goal                TEXT,
-      opened_by           TEXT,
-      opened_at           TEXT,
-      closed_at           TEXT,
-      close_reason        TEXT,
-      max_turns           INTEGER NOT NULL,
-      max_wall_clock_sec  INTEGER NOT NULL,
-      max_tokens_per_side INTEGER NOT NULL,
-      turn_counts         TEXT NOT NULL,         -- JSON: { peerId: count }
-      token_counts        TEXT NOT NULL          -- JSON: { peerId: count }
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_threads_open ON threads(closed_at) WHERE closed_at IS NULL;
-
-    CREATE TABLE IF NOT EXISTS audit_log (
-      id                 TEXT PRIMARY KEY,
-      tool_name          TEXT NOT NULL,
-      caller_id          TEXT NOT NULL,
-      thread_id          TEXT,
-      origin_thread_id   TEXT,
-      origin_message_id  TEXT,
-      args_hash          TEXT NOT NULL,
-      result             TEXT NOT NULL,           -- 'allowed' | 'blocked'
-      reason             TEXT,
-      called_at          TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_audit_called    ON audit_log(called_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_caller    ON audit_log(caller_id, called_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_thread    ON audit_log(thread_id, called_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_origin    ON audit_log(origin_thread_id, called_at DESC);
-
-    -- thread_participants: who is "in" a thread for fan-out routing.
-    -- Joining is explicit (synapse_join_thread) or implicit (sending/replying
-    -- on a thread:<id>, opening auto on the thread). Inbox surfaces messages
-    -- where to_id = "thread:<id>" only to peers in this table for that thread.
-    CREATE TABLE IF NOT EXISTS thread_participants (
-      thread_id  TEXT NOT NULL,
-      peer_id    TEXT NOT NULL,
-      joined_at  TEXT NOT NULL,
-      PRIMARY KEY (thread_id, peer_id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_participants_peer ON thread_participants(peer_id);
-  `);
+  d.exec(INIT_SCHEMA_SQL);
 }
 
 // node:sqlite uses $name for named params (vs better-sqlite3's @name).
@@ -142,9 +70,28 @@ export function listActivePeers(config: SynapseConfig): Peer[] {
   `).all(cutoff) as unknown as Peer[];
 }
 
+// Multiplier on top of the heartbeat window before a silent peer is
+// hard-pruned. 2 = 20min at the default 600s heartbeat. Bump via env on
+// a flaky link. Synapse_cleanup with `purgeAll` ignores this cushion.
+export function getPeerGcMultiplier(): number {
+  const raw = process.env.SYNAPSE_PEER_GC_MULTIPLIER;
+  if (!raw) return 2;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 1 ? n : 2;
+}
+
+// Drop every peer row except the caller. Used by synapse_cleanup with
+// purgeAll. Bypasses the heartbeat cushion entirely.
+export function dropPeersExcept(config: SynapseConfig, keepId: string): number {
+  return Number(getDb(config).prepare(
+    `DELETE FROM peers WHERE id != ?`,
+  ).run(keepId).changes);
+}
+
 export function pruneStalePeers(config: SynapseConfig): number {
-  // Hard-prune peers silent for 6× the heartbeat window.
-  const cutoff = new Date(Date.now() - config.peerHeartbeatTimeoutSeconds * 6_000).toISOString();
+  // Hard-prune peers silent for >Nx the heartbeat window.
+  const cushionMs = config.peerHeartbeatTimeoutSeconds * 1000 * getPeerGcMultiplier();
+  const cutoff = new Date(Date.now() - cushionMs).toISOString();
   return Number(getDb(config).prepare(
     `DELETE FROM peers WHERE last_seen_at < ?`,
   ).run(cutoff).changes);
@@ -456,6 +403,180 @@ export function listMyThreads(
     ORDER BY joined_at DESC
   `).all(peerId);
   return (rows as Array<{ threadId: string }>).map(r => r.threadId);
+}
+
+// ── Active-file scan + staleness ───────────────────────────────────
+// Source-of-truth predicates for the synapse_cleanup tool, the
+// SessionStart hook GC, and any future tooling that has to reason
+// about which active-<label>-*.json files are zombies. Keep all of
+// "what is stale?" logic here so callers can't drift.
+
+export interface ActiveFileInfo {
+  path: string;
+  name: string;
+  mtimeMs: number;
+  parsed: {
+    id?: string;
+    label?: string;
+    sessionId?: string;
+    ppid?: number;
+    mcpPid?: number;
+    registeredAt?: string;
+    source?: string;
+  } | null;
+  parseError: boolean;
+}
+
+export function listActiveFiles(
+  config: SynapseConfig,
+  label?: string,
+): ActiveFileInfo[] {
+  const paths = buildIdentityPaths(config.dataDir);
+  const prefix = label ? basename(paths.activePrefix(label)) : 'active-';
+  let entries: string[] = [];
+  try { entries = readdirSync(paths.dataDir); } catch { return []; }
+
+  const out: ActiveFileInfo[] = [];
+  for (const name of entries) {
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue;
+    const full = join(paths.dataDir, name);
+    let stat;
+    try { stat = statSync(full); } catch { continue; }
+    let parsed: ActiveFileInfo['parsed'] = null;
+    let parseError = false;
+    try { parsed = JSON.parse(readFileSync(full, 'utf-8')); }
+    catch { parseError = true; }
+    out.push({ path: full, name, mtimeMs: stat.mtimeMs, parsed, parseError });
+  }
+  return out;
+}
+
+// Liveness check for an MCP process. Uses process.kill(pid, 0) — POSIX-ish
+// no-op signal that returns true if the pid is owned by us and alive.
+// Required for cross-platform reliability: on Windows-native, ppid in the
+// active file is the SessionStart hook's parent (not the MCP server), so
+// only mcpPid is a reliable liveness signal.
+export function isPidAlive(pid: number | undefined | null): boolean {
+  if (!pid || !Number.isFinite(pid)) return false;
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+export interface StalenessReason {
+  reason:
+    | 'parse-error'
+    | 'missing-id'
+    | 'orphan-no-peer'
+    | 'peer-silent'
+    | 'mcp-pid-dead'
+    | 'duplicate-session'
+    | 'live';
+  detail?: string;
+}
+
+// Decide whether an active file is stale relative to peers DB and config.
+// `liveSessions` is the set of (label, sessionId) pairs we just confirmed
+// live (e.g. the calling session) — never reaped regardless of other signals.
+// Reasons in priority order: malformed file, no peer row, peer silent past
+// cushion, MCP pid recorded but process dead, duplicate sessionId for the
+// same label (newest mtime wins).
+export function classifyActiveFile(
+  config: SynapseConfig,
+  info: ActiveFileInfo,
+  opts: {
+    keepIds?: Set<string>;
+    duplicateOf?: ActiveFileInfo;
+  } = {},
+): StalenessReason {
+  if (info.parseError || !info.parsed) {
+    return { reason: 'parse-error' };
+  }
+  if (!info.parsed.id) {
+    return { reason: 'missing-id' };
+  }
+  if (opts.keepIds?.has(info.parsed.id)) {
+    return { reason: 'live', detail: 'kept by caller' };
+  }
+  if (opts.duplicateOf) {
+    return {
+      reason: 'duplicate-session',
+      detail: `superseded by ${opts.duplicateOf.name}`,
+    };
+  }
+  const peer = getPeer(config, info.parsed.id);
+  if (!peer) {
+    return { reason: 'orphan-no-peer' };
+  }
+  const cushionMs =
+    config.peerHeartbeatTimeoutSeconds * 1000 * getPeerGcMultiplier();
+  const ageMs = Date.now() - new Date(peer.lastSeenAt).getTime();
+  if (ageMs > cushionMs) {
+    return { reason: 'peer-silent', detail: `silent ${Math.round(ageMs / 1000)}s` };
+  }
+  if (info.parsed.mcpPid && !isPidAlive(info.parsed.mcpPid)) {
+    return { reason: 'mcp-pid-dead', detail: `pid ${info.parsed.mcpPid}` };
+  }
+  return { reason: 'live' };
+}
+
+// Best-effort delete; never throws.
+export function deleteActiveFile(info: ActiveFileInfo): boolean {
+  try { unlinkSync(info.path); return true; }
+  catch { return false; }
+}
+
+// True when the active file's name matches the v1.2+ canonical pattern
+// `active-<label>-<sessionId>.json` where the discriminator is a UUID
+// (not a small integer ppid). Used to prefer sessionId-keyed files over
+// legacy ppid-keyed files that may share the same `id` and `sessionId`
+// payload but were written by an older SessionStart hook.
+export function isSessionIdKeyedActiveFile(info: ActiveFileInfo): boolean {
+  const label = info.parsed?.label;
+  const sid = info.parsed?.sessionId;
+  if (!label || !sid) return false;
+  return info.name === `active-${label}-${sid}.json`;
+}
+
+// Compute which active files are duplicates of which canonical file.
+// Returns a map: stale path -> canonical info that supersedes it.
+// Tiebreak rules (in order):
+//   1. sessionId-keyed filename beats ppid-keyed filename.
+//   2. Newer mtime wins.
+// This is the single source of truth for "given two files claiming the
+// same (label, sessionId), which one do we keep?" so synapse_cleanup and
+// the SessionStart hook GC never disagree.
+export function findActiveFileDuplicates(
+  infos: ActiveFileInfo[],
+): Map<string, ActiveFileInfo> {
+  const winnerByKey = new Map<string, ActiveFileInfo>();
+  const dupOf = new Map<string, ActiveFileInfo>();
+  for (const f of infos) {
+    const sid = f.parsed?.sessionId;
+    const lbl = f.parsed?.label;
+    if (!sid || !lbl) continue;
+    const key = `${lbl}::${sid}`;
+    const incumbent = winnerByKey.get(key);
+    if (!incumbent) {
+      winnerByKey.set(key, f);
+      continue;
+    }
+    const challenger = preferActiveFile(incumbent, f);
+    if (challenger === f) {
+      dupOf.set(incumbent.path, f);
+      winnerByKey.set(key, f);
+    } else {
+      dupOf.set(f.path, incumbent);
+    }
+  }
+  return dupOf;
+}
+
+function preferActiveFile(a: ActiveFileInfo, b: ActiveFileInfo): ActiveFileInfo {
+  const aSession = isSessionIdKeyedActiveFile(a);
+  const bSession = isSessionIdKeyedActiveFile(b);
+  if (aSession && !bSession) return a;
+  if (bSession && !aSession) return b;
+  return a.mtimeMs >= b.mtimeMs ? a : b;
 }
 
 export function listAudit(

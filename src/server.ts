@@ -14,6 +14,10 @@ import {
   getThreadState, upsertThread, closeThread, listOpenAutoThreads,
   logAudit, listAudit,
   joinThread, leaveThread, listThreadParticipants, listMyThreads,
+  listActiveFiles, classifyActiveFile, deleteActiveFile,
+  findActiveFileDuplicates,
+  dropPeersExcept,
+  type ActiveFileInfo,
 } from './storage.js';
 import { generateClientId } from './identity.js';
 import type {
@@ -77,18 +81,58 @@ function tryAdoptFromHook(): { id: string; label: string; sessionId: string | nu
 
 function readActiveFile(path: string): { id: string; label: string; sessionId: string | null } | null {
   if (!existsSync(path)) return null;
-  let parsed: { id?: string; label?: string; sessionId?: string };
+  let parsed: { id?: string; label?: string; sessionId?: string; registeredAt?: string };
   try { parsed = JSON.parse(readFileSync(path, 'utf-8')); } catch { return null; }
   if (!parsed.id || !parsed.label) return null;
   const peer = getPeer(config, parsed.id);
-  if (!peer) return null;
-  const ageMs = Date.now() - new Date(peer.lastSeenAt).getTime();
-  if (ageMs > config.peerHeartbeatTimeoutSeconds * 1000) return null;
+  if (peer) {
+    const ageMs = Date.now() - new Date(peer.lastSeenAt).getTime();
+    if (ageMs > config.peerHeartbeatTimeoutSeconds * 1000) return null;
+  } else {
+    // Peer row missing but the active file is on disk. If the file is
+    // fresh (within heartbeat window by mtime), the SessionStart hook —
+    // or a prior process of this same MCP — wrote it recently, so the
+    // identity is still good even if a cleanup pass dropped the peer row.
+    // Re-insert and adopt. Avoids identity churn ("/mcp reconnect after
+    // synapse_cleanup --purgeAll" → fresh peer ID + abandoned old ID).
+    let mtimeMs: number;
+    try { mtimeMs = statSync(path).mtimeMs; } catch { return null; }
+    const ageMs = Date.now() - mtimeMs;
+    if (ageMs > config.peerHeartbeatTimeoutSeconds * 1000) return null;
+    const now = new Date().toISOString();
+    upsertPeer(config, {
+      id: parsed.id,
+      label: parsed.label,
+      registeredAt: parsed.registeredAt ?? now,
+      lastSeenAt: now,
+      capabilities: null,
+    });
+  }
   return {
     id: parsed.id,
     label: parsed.label,
     sessionId: parsed.sessionId ?? null,
   };
+}
+
+// After adoption, rewrite the active file to include the MCP server's
+// own pid so liveness probes (process.kill(pid, 0)) work cross-platform.
+// SessionStart only knows the hook's ppid, which on Windows-native is a
+// different process tree from the MCP server. Best-effort — never throws.
+function stampMcpPidIntoActiveFile(label: string, sessionId: string | null): void {
+  const candidates: string[] = [];
+  if (sessionId) candidates.push(paths.active(label, sessionId));
+  candidates.push(paths.activeByPpid(label, PPID));
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    let parsed: Record<string, unknown>;
+    try { parsed = JSON.parse(readFileSync(path, 'utf-8')); }
+    catch { continue; }
+    if (parsed.mcpPid === process.pid) continue;
+    parsed.mcpPid = process.pid;
+    try { writeFileSync(path, JSON.stringify(parsed, null, 2), 'utf-8'); }
+    catch { /* best-effort */ }
+  }
 }
 
 interface ActiveFileCandidate {
@@ -238,6 +282,7 @@ function requireSelf(): string {
       selfLabel = adopted.label;
       selfSessionId = adopted.sessionId;
       touchPeer(config, selfId);
+      stampMcpPidIntoActiveFile(adopted.label, adopted.sessionId);
     }
   }
   if (!selfId) {
@@ -261,6 +306,7 @@ function requireSelf(): string {
     const payload = JSON.stringify({
       id, label, registeredAt: now,
       sessionId, ppid: PPID,
+      mcpPid: process.pid,
       source: 'mcp-bootstrap',
     }, null, 2);
     try { writeFileSync(paths.active(label, sessionId), payload, 'utf-8'); }
@@ -323,6 +369,7 @@ const server = new McpServer(
       '- synapse_pause({ threadId }) — kill switch.',
       '- synapse_wait_reply({ messageId, timeoutSec?, pollIntervalSec? }) — server-side long-poll for a thread reply.',
       '- synapse_audit({ threadId?, callerId?, limit? }) — provenance log.',
+      '- synapse_cleanup({ dryRun?, purgeAll?, label? }) — reap zombie active-*.json + silent peer rows. The calling session is always kept.',
       '- synapse_diag() — read-only health dump: self, ppid map, active files, claude env vars. Use when identity adoption looks wrong.',
       '',
       'Messages auto-expire after 24h. Peers auto-expire after 10 min of silence.',
@@ -831,6 +878,101 @@ server.registerTool(
   },
 );
 
+// ── synapse_cleanup ───────────────────────────────────────────────
+
+server.registerTool(
+  'synapse_cleanup',
+  {
+    title: 'Clean up stale peers + active files',
+    description: 'Reap zombie active-<label>-*.json files and silent peer rows. Cleanup criteria: parse error, missing peer row, peer silent past cushion (SYNAPSE_PEER_GC_MULTIPLIER × heartbeat), recorded mcpPid not alive, or duplicate sessionId for the same label (sessionId-keyed filename beats ppid-keyed; newer mtime breaks ties within the same naming scheme). The calling session is always kept. Use when peer / active-file lists look wrong and you don\'t want to wait for the SessionStart-hook GC.',
+    inputSchema: z.object({
+      dryRun: z.boolean().optional().describe('Default false. When true, return the plan without deleting anything.'),
+      purgeAll: z.boolean().optional().describe('Default false. When true, every file/peer except the calling session is reaped, ignoring the cushion. Use to reset state when many peers stuck.'),
+      label: z.string().optional().describe('Restrict scan to this label (e.g. "code"). Default: caller\'s SYNAPSE_LABEL or all labels.'),
+    }),
+  },
+  async ({ dryRun, purgeAll, label }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    const scanLabel = label ?? selfLabel ?? undefined;
+    const before = listActiveFiles(config, scanLabel);
+
+    // Identify duplicates by (label, sessionId). Tiebreak prefers
+    // sessionId-keyed filenames over legacy ppid-keyed copies (the old
+    // SessionStart hook wrote both within ~1ms; mtime alone would falsely
+    // prefer the ppid-keyed file). Logic centralized in storage.ts so
+    // synapse_cleanup and the hook GC apply identical rules.
+    const dupOf = findActiveFileDuplicates(before);
+
+    const keepIds = new Set<string>([self]);
+    const plan = before.map(f => {
+      const reasonObj = purgeAll && f.parsed?.id !== self
+        ? { reason: 'duplicate-session' as const, detail: 'purgeAll' }
+        : classifyActiveFile(config, f, {
+            keepIds,
+            duplicateOf: dupOf.get(f.path),
+          });
+      return {
+        name: f.name,
+        id: f.parsed?.id ?? null,
+        sessionId: f.parsed?.sessionId ?? null,
+        mcpPid: f.parsed?.mcpPid ?? null,
+        mtime: new Date(f.mtimeMs).toISOString(),
+        decision: reasonObj.reason === 'live' ? 'keep' : 'delete',
+        reason: reasonObj.reason,
+        detail: reasonObj.detail ?? null,
+        info: f,
+      };
+    });
+
+    const toDelete = plan.filter(p => p.decision === 'delete');
+    const toKeep = plan.filter(p => p.decision === 'keep');
+    let deletedCount = 0;
+    let prunedPeers = 0;
+
+    if (!dryRun) {
+      for (const p of toDelete) {
+        if (deleteActiveFile(p.info)) deletedCount++;
+      }
+      // Also prune peer rows. purgeAll: drop everything but self. Otherwise
+      // honor the cushion via pruneStalePeers.
+      prunedPeers = purgeAll
+        ? dropPeersExcept(config, self)
+        : pruneStalePeers(config);
+    }
+
+    const after = dryRun ? before : listActiveFiles(config, scanLabel);
+
+    recordAudit(
+      'synapse_cleanup',
+      self,
+      null,
+      { dryRun: !!dryRun, purgeAll: !!purgeAll, label: scanLabel ?? null },
+      'allowed',
+    );
+
+    return json({
+      dryRun: !!dryRun,
+      purgeAll: !!purgeAll,
+      scanLabel: scanLabel ?? null,
+      counts: {
+        before: before.length,
+        after: after.length,
+        deleted: deletedCount,
+        prunedPeers,
+      },
+      kept: toKeep.map(p => ({
+        name: p.name, id: p.id, sessionId: p.sessionId,
+        mcpPid: p.mcpPid, reason: p.reason, detail: p.detail,
+      })),
+      deleted: toDelete.map(p => ({
+        name: p.name, id: p.id, sessionId: p.sessionId,
+        mcpPid: p.mcpPid, reason: p.reason, detail: p.detail,
+      })),
+    });
+  },
+);
+
 // ── synapse_diag ──────────────────────────────────────────────────
 
 server.registerTool(
@@ -841,6 +983,21 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
+    // Best-effort adoption so diag isn't the odd one out that always
+    // reports `self: null` when it's the first synapse tool called in a
+    // session. Read-only — never bootstrap, never throw.
+    if (!selfId) {
+      try {
+        const adopted = tryAdoptFromHook();
+        if (adopted) {
+          selfId = adopted.id;
+          selfLabel = adopted.label;
+          selfSessionId = adopted.sessionId;
+          touchPeer(config, selfId);
+        }
+      } catch { /* diag is read-only; swallow */ }
+    }
+
     const label = process.env.SYNAPSE_LABEL ?? null;
     const envKeys = Object.keys(process.env)
       .filter(k => /^(CLAUDE|ANTHROPIC|MCP|SESSION|HOOK|SYNAPSE)/i.test(k))
