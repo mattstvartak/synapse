@@ -1435,6 +1435,71 @@ export function fulfillRecruit(config: SynapseConfig, recruitId: string): void {
   `).run(now, recruitId);
 }
 
+// v7.1 #2 — find the most recent open recruit on a thread that the
+// joining peer's caps satisfy, mark it fulfilled, return its id (or
+// null if no match). Called from synapse_join_thread after the peer
+// is added to the roster, so explicit joins close out their
+// originating recruit just like hook-side auto-joins do. Older
+// matching recruits stay open and expire normally — their originators
+// may have given up and re-recruited, so we only close the freshest.
+//
+// Caps semantics mirror the post-tool-use hook auto-join:
+//   - requireAll=true: peer must have every recruit cap
+//   - requireAll=false: peer must have at least one
+//   - excludeCaps: any match disqualifies
+//   - empty caps list: any peer matches
+export function fulfillMatchingRecruit(
+  config: SynapseConfig,
+  threadId: string,
+  peerId: string,
+): string | null {
+  const candidates = getDb(config).prepare(`
+    SELECT id, capabilities, require_all AS requireAll, exclude_caps AS excludeCaps
+    FROM recruits
+    WHERE thread_id = ?
+      AND fulfilled_at IS NULL
+      AND expired_at IS NULL
+    ORDER BY created_at DESC
+  `).all(threadId) as Array<{
+    id: string;
+    capabilities: string | null;
+    requireAll: number;
+    excludeCaps: string | null;
+  }>;
+  if (candidates.length === 0) return null;
+
+  const peer = getPeer(config, peerId);
+  let peerCaps: string[] = [];
+  if (peer) {
+    if (typeof peer.capabilities === 'string' && peer.capabilities) {
+      try { peerCaps = JSON.parse(peer.capabilities) as string[]; } catch { peerCaps = []; }
+    } else if (Array.isArray(peer.capabilities)) {
+      peerCaps = peer.capabilities as string[];
+    }
+  }
+
+  for (const r of candidates) {
+    let recruitCaps: string[] = [];
+    if (r.capabilities) {
+      try { recruitCaps = JSON.parse(r.capabilities) as string[]; } catch { recruitCaps = []; }
+    }
+    let excludeCaps: string[] = [];
+    if (r.excludeCaps) {
+      try { excludeCaps = JSON.parse(r.excludeCaps) as string[]; } catch { excludeCaps = []; }
+    }
+    if (excludeCaps.some(c => peerCaps.includes(c))) continue;
+    let match = false;
+    if (recruitCaps.length === 0) match = true;
+    else if (r.requireAll === 1) match = recruitCaps.every(c => peerCaps.includes(c));
+    else match = recruitCaps.some(c => peerCaps.includes(c));
+    if (match) {
+      fulfillRecruit(config, r.id);
+      return r.id;
+    }
+  }
+  return null;
+}
+
 // Select prospects matching the recruit's capability filter. Excludes
 // the originator and any peers currently in peer_busy_state. Caps are
 // matched any-of by default; requireAll flips to all-of. excludeCaps

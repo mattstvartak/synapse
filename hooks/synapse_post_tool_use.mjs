@@ -328,6 +328,15 @@ try {
         ON CONFLICT(peer_id) DO UPDATE SET busy_at=excluded.busy_at, busy_reason=excluded.busy_reason
       `).run(selfId, now);
 
+      // v7.1 #2 — close the recruit row so the daemon GC sweep doesn't
+      // emit a stale [RECRUIT_EXPIRED] notice to the originator after
+      // it's already been answered. No-op if already fulfilled (some
+      // other peer beat us to it; race is benign).
+      db.prepare(`
+        UPDATE recruits SET fulfilled_at = ?
+        WHERE id = ? AND fulfilled_at IS NULL
+      `).run(now, recruitId);
+
       db.exec('COMMIT');
       autoJoinedNotices.push(
         `recruit ${recruitId} auto-joined on thread ${targetThreadId.slice(0, 8)}…`,

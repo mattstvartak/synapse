@@ -24,7 +24,7 @@ import {
   pruneStaleBusyState, clearAllPeerBusyState,
   appendPeerIdleEvent, getLatestPeerIdleEvents, pruneStaleIdleLog,
   insertRecruit, findRecentRecruit, countRecentRecruits,
-  expireRecruits, fulfillRecruit, selectRecruitProspects,
+  expireRecruits, fulfillRecruit, fulfillMatchingRecruit, selectRecruitProspects,
 } from '../dist/storage.js';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'synapse-recruit-test-'));
@@ -300,6 +300,128 @@ test('fulfillRecruit: sets fulfilled_at; idempotent on double-call', () => {
   // Verify by reading row directly.
   const row = getDb(config).prepare(`SELECT fulfilled_at FROM recruits WHERE id = ?`).get(r.id);
   assert.ok(row.fulfilled_at, 'fulfilled_at should be set');
+});
+
+// v7.1 #2 — fulfillMatchingRecruit closes the freshest open recruit
+// on a thread when a peer's caps satisfy the criteria.
+test('v7.1 #2 fulfillMatchingRecruit: any-of caps match', () => {
+  reset();
+  addPeer('code-orig', 'code');
+  addPeer('code-joiner', 'code', ['typescript']);
+  const tid = randomUUID();
+  const r = makeRecruit({ threadId: tid, capabilities: ['typescript', 'rust'] });
+  insertRecruit(config, r);
+  const matched = fulfillMatchingRecruit(config, tid, 'code-joiner');
+  assert.equal(matched, r.id);
+  const row = getDb(config).prepare(`SELECT fulfilled_at FROM recruits WHERE id = ?`).get(r.id);
+  assert.ok(row.fulfilled_at, 'fulfilled_at set after match');
+});
+
+test('v7.1 #2 fulfillMatchingRecruit: empty recruit caps matches any peer', () => {
+  reset();
+  addPeer('code-orig', 'code');
+  addPeer('code-joiner', 'code'); // no caps
+  const tid = randomUUID();
+  const r = makeRecruit({ threadId: tid, capabilities: null });
+  insertRecruit(config, r);
+  const matched = fulfillMatchingRecruit(config, tid, 'code-joiner');
+  assert.equal(matched, r.id);
+});
+
+test('v7.1 #2 fulfillMatchingRecruit: requireAll caps mismatch returns null', () => {
+  reset();
+  addPeer('code-orig', 'code');
+  addPeer('code-joiner', 'code', ['typescript']);
+  const tid = randomUUID();
+  const r = makeRecruit({ threadId: tid, capabilities: ['typescript', 'rust'], requireAll: true });
+  insertRecruit(config, r);
+  const matched = fulfillMatchingRecruit(config, tid, 'code-joiner');
+  assert.equal(matched, null);
+  const row = getDb(config).prepare(`SELECT fulfilled_at FROM recruits WHERE id = ?`).get(r.id);
+  assert.equal(row.fulfilled_at, null, 'recruit stays open on mismatch');
+});
+
+test('v7.1 #2 fulfillMatchingRecruit: excludeCaps disqualifies', () => {
+  reset();
+  addPeer('code-orig', 'code');
+  addPeer('code-joiner', 'code', ['typescript', 'experimental']);
+  const tid = randomUUID();
+  const r = makeRecruit({
+    threadId: tid,
+    capabilities: ['typescript'],
+    excludeCaps: ['experimental'],
+  });
+  insertRecruit(config, r);
+  const matched = fulfillMatchingRecruit(config, tid, 'code-joiner');
+  assert.equal(matched, null, 'excludeCaps overrides positive cap match');
+});
+
+test('v7.1 #2 fulfillMatchingRecruit: only freshest matching recruit fulfilled', () => {
+  reset();
+  addPeer('code-orig', 'code');
+  addPeer('code-joiner', 'code', ['typescript']);
+  const tid = randomUUID();
+  const oldR = makeRecruit({
+    threadId: tid,
+    capabilities: ['typescript'],
+    createdAt: new Date(Date.now() - 60_000).toISOString(),
+  });
+  const newR = makeRecruit({
+    threadId: tid,
+    capabilities: ['typescript'],
+    createdAt: new Date().toISOString(),
+  });
+  insertRecruit(config, oldR);
+  insertRecruit(config, newR);
+  const matched = fulfillMatchingRecruit(config, tid, 'code-joiner');
+  assert.equal(matched, newR.id, 'most recent matching recruit closed');
+  const oldRow = getDb(config).prepare(`SELECT fulfilled_at FROM recruits WHERE id = ?`).get(oldR.id);
+  assert.equal(oldRow.fulfilled_at, null, 'older recruit stays open — its originator may have given up + re-recruited');
+});
+
+test('v7.1 #2 fulfillMatchingRecruit: skips already-fulfilled recruits', () => {
+  reset();
+  addPeer('code-orig', 'code');
+  addPeer('code-joiner', 'code', ['typescript']);
+  const tid = randomUUID();
+  const fulfilled = makeRecruit({
+    threadId: tid,
+    capabilities: ['typescript'],
+    fulfilledAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+  });
+  const open = makeRecruit({
+    threadId: tid,
+    capabilities: ['typescript'],
+    createdAt: new Date(Date.now() - 30_000).toISOString(),
+  });
+  insertRecruit(config, fulfilled);
+  insertRecruit(config, open);
+  const matched = fulfillMatchingRecruit(config, tid, 'code-joiner');
+  // Should pick the older-but-open one since the freshest is already fulfilled.
+  assert.equal(matched, open.id);
+});
+
+test('v7.1 #2 fulfillMatchingRecruit: skips expired recruits', () => {
+  reset();
+  addPeer('code-orig', 'code');
+  addPeer('code-joiner', 'code', ['typescript']);
+  const tid = randomUUID();
+  const expired = makeRecruit({
+    threadId: tid,
+    capabilities: ['typescript'],
+    expiredAt: new Date().toISOString(),
+  });
+  insertRecruit(config, expired);
+  const matched = fulfillMatchingRecruit(config, tid, 'code-joiner');
+  assert.equal(matched, null);
+});
+
+test('v7.1 #2 fulfillMatchingRecruit: returns null when no recruits on thread', () => {
+  reset();
+  addPeer('code-joiner', 'code', ['typescript']);
+  const matched = fulfillMatchingRecruit(config, randomUUID(), 'code-joiner');
+  assert.equal(matched, null);
 });
 
 test('expireRecruits: deserializes JSON cap arrays correctly', () => {

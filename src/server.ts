@@ -28,7 +28,7 @@ import {
   pruneStaleBusyState, clearAllPeerBusyState,
   appendPeerIdleEvent,
   insertRecruit, findRecentRecruit, countRecentRecruits,
-  expireRecruits, fulfillRecruit, selectRecruitProspects,
+  expireRecruits, fulfillRecruit, fulfillMatchingRecruit, selectRecruitProspects,
   type ActiveFileInfo,
   type BusyReason,
   type IdleReason,
@@ -1224,8 +1224,25 @@ server.registerTool(
     const self = requireSelf();
     touchPeer(config, self);
     const added = joinThread(config, threadId, self);
-    recordAudit('synapse_join_thread', self, threadId, { threadId }, 'allowed');
-    return json({ threadId, joined: added, alreadyJoined: !added });
+    // v7.1 #2 — close out an originating recruit on first explicit join.
+    // Only run on the freshly-added path; an already-on-roster join means
+    // the recruit (if any) was already fulfilled at the time of first
+    // touch. Older matching recruits stay open and expire normally.
+    let fulfilledRecruitId: string | null = null;
+    if (added) {
+      try { fulfilledRecruitId = fulfillMatchingRecruit(config, threadId, self); }
+      catch { /* best-effort — never fail a join because of recruit bookkeeping */ }
+    }
+    recordAudit('synapse_join_thread', self, threadId, {
+      threadId,
+      ...(fulfilledRecruitId ? { fulfilledRecruitId } : {}),
+    }, 'allowed');
+    return json({
+      threadId,
+      joined: added,
+      alreadyJoined: !added,
+      ...(fulfilledRecruitId ? { fulfilledRecruitId } : {}),
+    });
   },
 );
 
