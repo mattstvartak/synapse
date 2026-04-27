@@ -432,6 +432,29 @@ export async function runDaemon(): Promise<void> {
     process.exit(1);
   });
 
+  // §1.5(b) — TCP keepalive on every incoming connection. Long-poll
+  // wait_reply requests can sit idle for up to 300s waiting for a peer
+  // reply; without keepalive packets at the OS layer, NAT / proxy /
+  // firewall idle timers tear down the connection silently and the
+  // shim sees "Connection closed" mid-poll. Setting keepAlive on the
+  // raw socket emits TCP-level probes every 30s, holding the path
+  // open across idle periods. setTimeout(0) disables Node's per-socket
+  // idle timeout for the same reason.
+  httpServer.on('connection', (socket) => {
+    try {
+      socket.setKeepAlive(true, 30_000);
+      socket.setTimeout(0);
+    } catch {
+      // best-effort; never crash the connection handler
+    }
+  });
+  // Tune Node http server timeouts so a long-running response (e.g.
+  // 300s wait_reply) isn't killed by the default 5min header-keepalive
+  // ceiling. headersTimeout must be > requestTimeout per Node docs.
+  httpServer.keepAliveTimeout = 310_000;
+  httpServer.headersTimeout = 320_000;
+  httpServer.requestTimeout = 0;
+
   httpServer.listen(port, HOST, () => {
     const state: DaemonState = {
       port,
