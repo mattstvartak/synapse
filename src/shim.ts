@@ -157,11 +157,18 @@ function writeShimActiveFile(label: string, peerId: string, identityToken: strin
 // reconnects within the same shim, distinct between separate shims.
 const SHIM_SESSION_FINGERPRINT = randomUUID();
 
-async function negotiateIdentity(
+interface BindAttempt {
+  contention: boolean;
+  contentionDetail?: string;
+  peerId?: string;
+  identityToken?: string;
+}
+
+async function tryBindIdentity(
   state: DaemonState,
   label: string,
-  identity: IdentityFile,
-): Promise<IdentityFile> {
+  identityToken: string,
+): Promise<BindAttempt> {
   const url = (process.env.SYNAPSE_DAEMON_URL ?? `http://127.0.0.1:${state.port}`).replace(/\/$/, '');
   const res = await fetch(`${url}/identity`, {
     method: 'POST',
@@ -171,36 +178,73 @@ async function negotiateIdentity(
     },
     body: JSON.stringify({
       label,
-      identityToken: identity.identityToken,
+      identityToken,
       sessionFingerprint: SHIM_SESSION_FINGERPRINT,
     }),
   });
   if (res.status === 409) {
-    // §1.11 — a different shim is actively holding this identity-token.
-    // Surface the daemon's detail so the user can act (delete identity
-    // file for fresh shim, or wait for eviction). Hard exit so Claude
-    // doesn't keep retrying with the same token.
     let detail = '';
     try { detail = JSON.stringify(await res.json()); } catch { /* nope */ }
-    throw new Error(
-      `synapse-shim: identity contention. The daemon refused this shim's bind because another active shim is using the same identity-token. ${detail}`,
-    );
+    return { contention: true, contentionDetail: detail };
   }
   if (!res.ok) {
     throw new Error(`synapse-shim: /identity returned ${res.status} ${res.statusText}`);
   }
   const body = await res.json() as { peerId?: string; identityToken?: string };
-  const updated: IdentityFile = {
-    identityToken: body.identityToken ?? identity.identityToken,
+  return {
+    contention: false,
     peerId: body.peerId,
+    identityToken: body.identityToken ?? identityToken,
   };
-  if (
-    updated.identityToken !== identity.identityToken ||
-    updated.peerId !== identity.peerId
-  ) {
-    writeIdentity(label, updated);
+}
+
+interface NegotiatedIdentity {
+  peerId?: string;
+  identityToken: string;
+  ephemeral: boolean;
+}
+
+async function negotiateIdentity(
+  state: DaemonState,
+  label: string,
+  identity: IdentityFile,
+): Promise<NegotiatedIdentity> {
+  // First attempt: use the sticky identity-token from <label>-identity.json.
+  // The first concurrent session per label always wins this — its peerId
+  // stays stable across reconnects, which is the whole point of the sticky
+  // file.
+  const sticky = await tryBindIdentity(state, label, identity.identityToken);
+  if (!sticky.contention) {
+    const updated: IdentityFile = {
+      identityToken: sticky.identityToken ?? identity.identityToken,
+      peerId: sticky.peerId,
+    };
+    if (
+      updated.identityToken !== identity.identityToken ||
+      updated.peerId !== identity.peerId
+    ) {
+      writeIdentity(label, updated);
+    }
+    return { peerId: updated.peerId, identityToken: updated.identityToken, ephemeral: false };
   }
-  return updated;
+
+  // §1.11 contention path. A previous shim with the same label is still
+  // bound to the on-disk token. Mint a one-shot ephemeral token so this
+  // session can run alongside the original. Do NOT persist — the on-disk
+  // file stays pinned to the first session so its sticky identity survives
+  // restart.
+  const ephemeralToken = randomUUID();
+  const fresh = await tryBindIdentity(state, label, ephemeralToken);
+  if (fresh.contention) {
+    throw new Error(
+      `synapse-shim: identity contention persisted across retry. Daemon refused both the sticky token and a freshly minted one — fingerprint may be reused. ${fresh.contentionDetail ?? ''}`,
+    );
+  }
+  return {
+    peerId: fresh.peerId,
+    identityToken: fresh.identityToken ?? ephemeralToken,
+    ephemeral: true,
+  };
 }
 
 export async function runShim(): Promise<void> {
@@ -213,10 +257,14 @@ export async function runShim(): Promise<void> {
   const state = await ensureDaemon();
   const identity = readIdentity(label);
   // Confirm identity with daemon before forwarding any frames so the very
-  // first MCP call already has a stable peer ID.
+  // first MCP call already has a stable peer ID. If the sticky token is
+  // already held by another shim (concurrent Claude session, same label),
+  // negotiateIdentity falls back to a one-shot ephemeral token so this
+  // session can coexist as a distinct peer.
   const negotiated = await negotiateIdentity(state, label, identity);
+  const activeIdentityToken = negotiated.identityToken;
   if (negotiated.peerId) {
-    writeShimActiveFile(label, negotiated.peerId, negotiated.identityToken);
+    writeShimActiveFile(label, negotiated.peerId, activeIdentityToken);
   }
 
   const url = (process.env.SYNAPSE_DAEMON_URL ?? `http://127.0.0.1:${state.port}`).replace(/\/$/, '');
@@ -240,7 +288,7 @@ export async function runShim(): Promise<void> {
         'Accept': 'application/json, text/event-stream',
         'Authorization': `Bearer ${state.token}`,
         'X-Synapse-Label': label,
-        'X-Synapse-Identity-Token': identity.identityToken,
+        'X-Synapse-Identity-Token': activeIdentityToken,
         // §1.11 — sessionFingerprint locks token-to-shim binding for the
         // life of the shim, blocking a different shim from claiming the
         // same identity-token while this one is still alive.
