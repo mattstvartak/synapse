@@ -26,10 +26,12 @@ import {
   countOutboundAwaitingReply,
   setPeerBusy, clearPeerBusy, getPeerBusyState,
   pruneStaleBusyState, clearAllPeerBusyState,
+  appendPeerIdleEvent,
   insertRecruit, findRecentRecruit, countRecentRecruits,
   expireRecruits, fulfillRecruit, selectRecruitProspects,
   type ActiveFileInfo,
   type BusyReason,
+  type IdleReason,
   type RecruitRow, type RecruitUrgency,
 } from './storage.js';
 import { generateClientId } from './identity.js';
@@ -1603,8 +1605,9 @@ server.registerTool(
   async ({ reason }) => {
     const self = requireSelf();
     touchPeer(config, self);
-    const tag = reason ?? 'EXPLICIT_IDLE';
+    const tag: IdleReason = (reason as IdleReason) ?? 'EXPLICIT_IDLE';
     clearPeerBusy(config, self);
+    appendPeerIdleEvent(config, self, tag);
     bumpCounter('busy.cleared');
     recordAudit('synapse_set_idle', self, null, { reason: tag }, 'allowed');
     return json({ peerId: self, idleAt: new Date().toISOString(), reason: tag });
@@ -1677,12 +1680,14 @@ server.registerTool(
     insertRecruit(config, recruit);
 
     // Select prospects matching cap filter, excluding originator + busy peers.
+    // Urgency=high includes EXPLICIT_AWAY peers; lower urgencies skip them.
     const prospects = selectRecruitProspects(config, {
       capabilities,
       requireAll,
       excludeCaps,
       excludeIds: [from],
       workspace: workspace ?? null,
+      urgency: urgencyTag,
     });
 
     // Originator joins the thread (so they see auto-join replies).
@@ -1690,9 +1695,10 @@ server.registerTool(
 
     // Broadcast a [RECRUIT] marker message. Body carries the structured
     // first line for hook-side parsing + the markdown description.
+    // `from=<peerId>` saves hooks an SQL join into the message envelope.
     const capsCsv = capabilities ? capabilities.join(',') : '';
     const urgencyShort = urgencyTag === 'high' ? 'h' : urgencyTag === 'low' ? 'l' : 'n';
-    const markerLine = `[RECRUIT] id=${recruitId} urgency=${urgencyShort} caps=${capsCsv} requireAll=${recruit.requireAll} threadId=${tid} originatorBusy=${recruit.originatorBusy}`;
+    const markerLine = `[RECRUIT] id=${recruitId} from=${from} urgency=${urgencyShort} caps=${capsCsv} requireAll=${recruit.requireAll} threadId=${tid} originatorBusy=${recruit.originatorBusy}`;
     const body = `${markerLine}\n\n${description}`;
 
     const broadcastId = randomUUID();

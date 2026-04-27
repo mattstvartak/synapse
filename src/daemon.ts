@@ -36,6 +36,7 @@ import { createSynapseServer, type SynapseSession } from './server.js';
 import {
   upsertPeer, getPeer, touchPeer,
   clearAllPeerBusyState, pruneStaleBusyState,
+  pruneStaleIdleLog,
   expireRecruits, insertMessage,
   listThreadParticipants,
   type RecruitRow,
@@ -555,6 +556,12 @@ export async function runDaemon(): Promise<void> {
       if (stalePruned > 0) bumpCounter('busy.stale_clears');
     } catch (err) {
       process.stderr.write(`synapse-daemon: stale-busy GC failed: ${(err as Error).message}\n`);
+    }
+    try {
+      const idlePruned = pruneStaleIdleLog(config);
+      if (idlePruned > 0) bumpCounter('busy.idle_log_pruned');
+    } catch (err) {
+      process.stderr.write(`synapse-daemon: idle-log GC failed: ${(err as Error).message}\n`);
     }
     try {
       const expired = expireRecruits(config);

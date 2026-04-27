@@ -22,6 +22,7 @@ import {
   upsertPeer,
   setPeerBusy, clearPeerBusy, getPeerBusyState,
   pruneStaleBusyState, clearAllPeerBusyState,
+  appendPeerIdleEvent, getLatestPeerIdleEvents, pruneStaleIdleLog,
   insertRecruit, findRecentRecruit, countRecentRecruits,
   expireRecruits, fulfillRecruit, selectRecruitProspects,
 } from '../dist/storage.js';
@@ -38,6 +39,7 @@ getDb(config);
 function reset() {
   const db = getDb(config);
   db.exec(`DELETE FROM peer_busy_state`);
+  db.exec(`DELETE FROM peer_idle_log`);
   db.exec(`DELETE FROM recruits`);
   db.exec(`DELETE FROM peers`);
   db.exec(`DELETE FROM messages`);
@@ -315,4 +317,107 @@ test('expireRecruits: deserializes JSON cap arrays correctly', () => {
   assert.deepEqual(expired[0].capabilities, ['typescript', 'node']);
   assert.deepEqual(expired[0].excludeCaps, ['experimental']);
   assert.equal(expired[0].requireAll, true);
+});
+
+// ── Idle log + sort precedence ─────────────────────────────────────
+
+test('idle log: append + getLatest returns most recent reason', () => {
+  reset();
+  addPeer('code-1', 'code');
+  appendPeerIdleEvent(config, 'code-1', 'CRON_ONLY');
+  appendPeerIdleEvent(config, 'code-1', 'USER_DONE');
+  const events = getLatestPeerIdleEvents(config, ['code-1']);
+  assert.equal(events.size, 1);
+  assert.equal(events.get('code-1').idleReason, 'USER_DONE');
+});
+
+test('idle log: pruneStaleIdleLog drops old rows only', () => {
+  reset();
+  addPeer('code-1', 'code');
+  // Insert old row directly
+  const db = getDb(config);
+  const oldTime = new Date(Date.now() - 3600_000).toISOString();
+  db.prepare(`INSERT INTO peer_idle_log (peer_id, idle_at, idle_reason) VALUES (?, ?, ?)`)
+    .run('code-1', oldTime, 'USER_DONE');
+  // Fresh row
+  appendPeerIdleEvent(config, 'code-1', 'EXPLICIT_IDLE');
+  const dropped = pruneStaleIdleLog(config, 1800);
+  assert.equal(dropped, 1);
+  const events = getLatestPeerIdleEvents(config, ['code-1']);
+  assert.equal(events.get('code-1').idleReason, 'EXPLICIT_IDLE');
+});
+
+test('prospect sort: USER_DONE precedes CRON_ONLY precedes EXPLICIT_IDLE', () => {
+  reset();
+  addPeer('code-explicit', 'code', ['typescript']);
+  addPeer('code-cron', 'code', ['typescript']);
+  addPeer('code-userdone', 'code', ['typescript']);
+  appendPeerIdleEvent(config, 'code-explicit', 'EXPLICIT_IDLE');
+  appendPeerIdleEvent(config, 'code-cron', 'CRON_ONLY');
+  appendPeerIdleEvent(config, 'code-userdone', 'USER_DONE');
+  const prospects = selectRecruitProspects(config, {
+    capabilities: ['typescript'],
+    excludeIds: [],
+  });
+  assert.deepEqual(prospects.map(p => p.id), ['code-userdone', 'code-cron', 'code-explicit']);
+});
+
+test('prospect sort: tiebreak by older idleAt within same reason', () => {
+  reset();
+  addPeer('code-recent', 'code', ['typescript']);
+  addPeer('code-rested', 'code', ['typescript']);
+  // code-rested has been idle longer (older idleAt → wins tiebreak)
+  const db = getDb(config);
+  db.prepare(`INSERT INTO peer_idle_log (peer_id, idle_at, idle_reason) VALUES (?, ?, ?)`)
+    .run('code-rested', new Date(Date.now() - 5000).toISOString(), 'USER_DONE');
+  db.prepare(`INSERT INTO peer_idle_log (peer_id, idle_at, idle_reason) VALUES (?, ?, ?)`)
+    .run('code-recent', new Date().toISOString(), 'USER_DONE');
+  const prospects = selectRecruitProspects(config, {
+    capabilities: ['typescript'],
+    excludeIds: [],
+  });
+  assert.deepEqual(prospects.map(p => p.id), ['code-rested', 'code-recent']);
+});
+
+test('prospect: EXPLICIT_AWAY excluded by default', () => {
+  reset();
+  addPeer('code-1', 'code', ['typescript']);
+  addPeer('code-2', 'code', ['typescript']);
+  appendPeerIdleEvent(config, 'code-1', 'USER_DONE');
+  appendPeerIdleEvent(config, 'code-2', 'EXPLICIT_AWAY');
+  const prospects = selectRecruitProspects(config, {
+    capabilities: ['typescript'],
+    excludeIds: [],
+    // urgency unset → default normal → EXPLICIT_AWAY filtered
+  });
+  assert.deepEqual(prospects.map(p => p.id), ['code-1']);
+});
+
+test('prospect: EXPLICIT_AWAY included when urgency=high', () => {
+  reset();
+  addPeer('code-1', 'code', ['typescript']);
+  addPeer('code-2', 'code', ['typescript']);
+  appendPeerIdleEvent(config, 'code-1', 'USER_DONE');
+  appendPeerIdleEvent(config, 'code-2', 'EXPLICIT_AWAY');
+  const prospects = selectRecruitProspects(config, {
+    capabilities: ['typescript'],
+    excludeIds: [],
+    urgency: 'high',
+  });
+  // Both included; USER_DONE sorts first, EXPLICIT_AWAY last.
+  assert.deepEqual(prospects.map(p => p.id), ['code-1', 'code-2']);
+});
+
+test('prospect: peer with no idle event treated as NEVER_BUSY', () => {
+  reset();
+  addPeer('code-fresh', 'code', ['typescript']);
+  addPeer('code-userdone', 'code', ['typescript']);
+  appendPeerIdleEvent(config, 'code-userdone', 'USER_DONE');
+  // code-fresh has no idle event, treated as NEVER_BUSY (weight 1).
+  const prospects = selectRecruitProspects(config, {
+    capabilities: ['typescript'],
+    excludeIds: [],
+  });
+  // USER_DONE (0) sorts before NEVER_BUSY (1).
+  assert.deepEqual(prospects.map(p => p.id), ['code-userdone', 'code-fresh']);
 });

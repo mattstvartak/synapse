@@ -1218,6 +1218,65 @@ export function pruneStaleBusyState(config: SynapseConfig, staleSec?: number): n
   return Number(result.changes ?? 0);
 }
 
+// ── §4.10 idle-event log (freshness signal for recruit sort) ──────
+
+export type IdleReason = 'USER_DONE' | 'EXPLICIT_IDLE' | 'NEVER_BUSY' | 'CRON_ONLY' | 'EXPLICIT_AWAY' | string;
+
+// Append an idle-event row. Called on busy → idle transitions so
+// recruit-prospect sort can prefer freshly-idle peers. EXPLICIT_AWAY
+// is treated as a soft "deprioritize me" signal: peers with this most
+// recent reason are excluded from recruits unless urgency=high.
+export function appendPeerIdleEvent(
+  config: SynapseConfig,
+  peerId: string,
+  reason: IdleReason,
+): void {
+  const now = new Date().toISOString();
+  getDb(config).prepare(`
+    INSERT INTO peer_idle_log (peer_id, idle_at, idle_reason) VALUES (?, ?, ?)
+  `).run(peerId, now, reason);
+}
+
+// Latest idle event per peer (peerId → { idleAt, idleReason }).
+// Used by selectRecruitProspects for sort order + EXPLICIT_AWAY filter.
+export interface PeerIdleEvent {
+  peerId: string;
+  idleAt: string;
+  idleReason: IdleReason;
+}
+
+export function getLatestPeerIdleEvents(
+  config: SynapseConfig,
+  peerIds: string[],
+): Map<string, PeerIdleEvent> {
+  if (peerIds.length === 0) return new Map();
+  const placeholders = peerIds.map(() => '?').join(',');
+  const rows = getDb(config).prepare(`
+    SELECT peer_id AS peerId, idle_at AS idleAt, idle_reason AS idleReason
+    FROM peer_idle_log
+    WHERE peer_id IN (${placeholders})
+    AND (peer_id, idle_at) IN (
+      SELECT peer_id, MAX(idle_at) FROM peer_idle_log
+      WHERE peer_id IN (${placeholders})
+      GROUP BY peer_id
+    )
+  `).all(...peerIds, ...peerIds) as unknown as PeerIdleEvent[];
+
+  const m = new Map<string, PeerIdleEvent>();
+  for (const r of rows) m.set(r.peerId, r);
+  return m;
+}
+
+// GC. Default cutoff 30min; override via SYNAPSE_IDLE_LOG_RETAIN_SEC.
+export function pruneStaleIdleLog(config: SynapseConfig, retainSec?: number): number {
+  const sec = retainSec ?? Number(process.env.SYNAPSE_IDLE_LOG_RETAIN_SEC ?? 1800);
+  const cutoff = new Date(Date.now() - sec * 1000).toISOString();
+  const result = getDb(config).prepare(`
+    DELETE FROM peer_idle_log WHERE idle_at < ?
+  `).run(cutoff);
+  return Number(result.changes ?? 0);
+}
+
 // ── §4.10 recruitment ─────────────────────────────────────────────
 
 export type RecruitUrgency = 'low' | 'normal' | 'high';
@@ -1358,7 +1417,22 @@ export interface RecruitProspectCriteria {
   // Heartbeat freshness: peer must have been seen within this window
   // (seconds). Default 600 = 10min, matches existing peer-staleness cutoff.
   freshnessSec?: number;
+  // §4.10 urgency-aware EXPLICIT_AWAY filter. By default EXPLICIT_AWAY
+  // peers are excluded ("deprioritize me"); pass urgency='high' to
+  // include them ("emergency, recruit anyone available").
+  urgency?: RecruitUrgency;
 }
+
+// IdleReason → sort weight (lower = preferred). Recruit-prospect sort
+// consults the most-recent peer_idle_log entry per peer; ties resolve
+// by older idleAt (peer has been resting longer).
+const IDLE_REASON_WEIGHT: Record<string, number> = {
+  USER_DONE: 0,
+  NEVER_BUSY: 1,
+  CRON_ONLY: 2,
+  EXPLICIT_IDLE: 3,
+  EXPLICIT_AWAY: 4,
+};
 
 export function selectRecruitProspects(
   config: SynapseConfig,
@@ -1390,7 +1464,7 @@ export function selectRecruitProspects(
   const requestedCaps = criteria.capabilities ?? [];
   const excludeCaps = criteria.excludeCaps ?? [];
 
-  return rows.filter((p: Peer) => {
+  const capFiltered = rows.filter((p: Peer) => {
     let peerCaps: string[] = [];
     if (typeof p.capabilities === 'string' && p.capabilities) {
       try { peerCaps = JSON.parse(p.capabilities) as string[]; } catch { peerCaps = []; }
@@ -1409,5 +1483,32 @@ export function selectRecruitProspects(
       return requestedCaps.every(c => peerCaps.includes(c));
     }
     return requestedCaps.some(c => peerCaps.includes(c));
+  });
+
+  if (capFiltered.length === 0) return [];
+
+  // Layer in idle-log freshness data + EXPLICIT_AWAY filter.
+  const idleEvents = getLatestPeerIdleEvents(config, capFiltered.map(p => p.id));
+  const isHighUrgency = criteria.urgency === 'high';
+
+  const awayFiltered = capFiltered.filter(p => {
+    const evt = idleEvents.get(p.id);
+    if (!evt) return true; // no idle event yet = NEVER_BUSY default, always recruitable
+    if (evt.idleReason === 'EXPLICIT_AWAY' && !isHighUrgency) return false;
+    return true;
+  });
+
+  // Sort by IdleReason precedence (USER_DONE > NEVER_BUSY > CRON_ONLY >
+  // EXPLICIT_IDLE > EXPLICIT_AWAY), tiebreak by older idleAt (rested longer).
+  return awayFiltered.sort((a, b) => {
+    const ea = idleEvents.get(a.id);
+    const eb = idleEvents.get(b.id);
+    const wa = ea ? (IDLE_REASON_WEIGHT[ea.idleReason] ?? 99) : IDLE_REASON_WEIGHT.NEVER_BUSY;
+    const wb = eb ? (IDLE_REASON_WEIGHT[eb.idleReason] ?? 99) : IDLE_REASON_WEIGHT.NEVER_BUSY;
+    if (wa !== wb) return wa - wb;
+    // Tiebreak: older idleAt sorts FIRST (resting longer = more available)
+    const ta = ea ? new Date(ea.idleAt).getTime() : 0;
+    const tb = eb ? new Date(eb.idleAt).getTime() : 0;
+    return ta - tb;
   });
 }

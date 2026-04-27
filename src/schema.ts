@@ -165,6 +165,23 @@ export const INIT_SCHEMA_SQL = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_busy_at ON peer_busy_state(busy_at);
+
+  -- §4.10 idle-event log. peer_busy_state row is gone on idle, so we
+  -- can't store IdleReason there. Instead append a row here on each
+  -- busy → idle transition. selectRecruitProspects reads MAX(idle_at)
+  -- per peer to break ties (freshness signal — peer with older
+  -- last_idle_at has been resting longer, more likely to be available).
+  --
+  -- Rotates: rows older than 30min are GC'd by the daemon timer.
+  -- Cap: storage helpers don't enforce a max size; relying on GC.
+  CREATE TABLE IF NOT EXISTS peer_idle_log (
+    peer_id     TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+    idle_at     TEXT NOT NULL,
+    idle_reason TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_idle_log_peer_at ON peer_idle_log(peer_id, idle_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_idle_log_at      ON peer_idle_log(idle_at);
 `;
 
 // Schema migrations for databases initialized against an older
