@@ -37,6 +37,7 @@ import {
   upsertPeer, getPeer, touchPeer,
 } from './storage.js';
 import { generateClientId } from './identity.js';
+import { inc as bumpCounter } from './counters.js';
 
 const DEFAULT_PORT = 8765;
 const HOST = '127.0.0.1';
@@ -107,12 +108,15 @@ function loadIdentityBindings(dataDir: string): void {
       });
     }
     process.stderr.write(`synapse-daemon: identityBindings.loaded count=${identityBindings.size}\n`);
+    bumpCounter('identityBindings.loaded_count', identityBindings.size);
   } catch (err) {
     // Degraded mode — start with empty Map and continue serving. Every
     // shim mints a fresh peerId until the next successful write. This
     // is the SAME behavior as before §1.6 shipped, so worst-case
     // regression is "back to v6.0 identity churn until file is rewritten."
     process.stderr.write(`synapse-daemon: identityBindings.fallback_to_memory reason=${(err as Error).message}\n`);
+    bumpCounter('identityBindings.parse_failures');
+    bumpCounter('identityBindings.fallback_to_memory');
     identityBindings.clear();
   }
 }
@@ -151,8 +155,10 @@ function flushIdentityBindingsSync(): void {
     mkdirSync(bindingsDataDir, { recursive: true });
     writeFileSync(tmpPath, JSON.stringify(obj, null, 2), 'utf-8');
     renameSync(tmpPath, finalPath);
+    bumpCounter('identityBindings.writes');
   } catch (err) {
     process.stderr.write(`synapse-daemon: identityBindings.write_failed: ${(err as Error).message}\n`);
+    bumpCounter('identityBindings.write_failures');
     // Best-effort cleanup of the orphan .tmp so the next attempt has a
     // clean slate. Never throw — the in-memory map is still authoritative.
     try { if (existsSync(tmpPath)) unlinkSync(tmpPath); }

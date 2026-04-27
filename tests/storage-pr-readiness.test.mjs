@@ -438,6 +438,27 @@ test('voluntary setDrafting overrides implicit on same (thread, peer)', () => {
   assert.ok(fromOther[0].etaInSec >= 110);
 });
 
+// §7 observability counters
+test('counters: inc + snapshot round-trip', async () => {
+  const { inc, get, snapshot, _resetForTests } = await import('../dist/counters.js');
+  _resetForTests();
+  inc('test.foo');
+  inc('test.foo');
+  inc('test.bar', 5);
+  assert.equal(get('test.foo'), 2);
+  assert.equal(get('test.bar'), 5);
+  assert.equal(get('test.unset'), 0);
+  const snap = snapshot();
+  assert.equal(snap.counters['test.foo'], 2);
+  assert.equal(snap.counters['test.bar'], 5);
+  assert.equal(typeof snap.startedAt, 'string');
+  assert.ok(snap.uptimeSec >= 0);
+  // Keys are sorted in the snapshot.
+  const keys = Object.keys(snap.counters);
+  const sorted = [...keys].sort();
+  assert.deepEqual(keys, sorted);
+});
+
 test('implicit markImplicitDrafting does NOT downgrade voluntary', () => {
   const PEER = 'cowork-impl4';
   upsertPeer(config, { id: PEER, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });

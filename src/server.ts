@@ -33,6 +33,7 @@ import {
   DEFAULT_AUTO_CAPS, buildIdentityPaths,
   isThreadAddress, threadIdFromAddress,
 } from './types.js';
+import { inc as bumpCounter, snapshot as countersSnapshot } from './counters.js';
 
 // Per-instance state and config injection. Stdio mode passes nothing
 // (everything self-derives from env). Daemon mode pre-populates selfId/
@@ -301,6 +302,7 @@ function tryAdoptIntoSelf(): boolean {
   selfSessionId = adopted.sessionId;
   touchPeer(config, selfId);
   stampMcpPidIntoActiveFile(adopted.label, adopted.sessionId);
+  bumpCounter('bootstrap.handler_adoptions');
   return true;
 }
 
@@ -331,6 +333,7 @@ function selfBootstrap(): void {
   selfId = id;
   selfLabel = label;
   selfSessionId = sessionId;
+  bumpCounter('bootstrap.handler_bootstraps');
 }
 
 // Best-effort identity initialization. Tries hook adoption first; if
@@ -371,6 +374,7 @@ function computePendingInbound(self: string): {
   oldestUnreadAgeSec: number | null;
 } {
   const head = pollInboxHead(config, self);
+  if (head.count > 0) bumpCounter('pendingInbound.surfaced_nonzero');
   return {
     count: head.count,
     fromPeerIds: head.fromPeerIds,
@@ -524,6 +528,7 @@ server.registerTool(
     if (!threadId && to !== 'broadcast' && !isThreadAddress(to)) {
       const sharedThread = findRecentSharedThread(config, from, to);
       if (sharedThread) {
+        bumpCounter('send.fragmentation_blocks');
         throw new Error(
           `Refusing to mint a new thread: an active thread (${sharedThread}) already exists between ${from} and ${to}. ` +
           `Use synapse_reply({ messageId }) to continue the conversation, or pass threadId="${sharedThread}" explicitly to synapse_send. ` +
@@ -626,6 +631,8 @@ server.registerTool(
     // synapse_send/reply can auto-ack them and skip the false-positive
     // pendingInbound alert.
     for (const m of messages) recentlySeenMessageIds.add(m.id);
+    if (messages.length === 0) bumpCounter('poll.empty_returns');
+    else bumpCounter('poll.with_results');
     return json({
       count: messages.length,
       messages,
@@ -872,6 +879,7 @@ server.registerTool(
         m.threadId === targetThread && m.fromId !== self,
       );
       if (match) {
+        bumpCounter('wait_reply.fulfilled');
         recordAudit('synapse_wait_reply', self, targetThread, { messageId }, 'allowed');
         return json({ status: 'replied', message: match });
       }
@@ -885,6 +893,8 @@ server.registerTool(
     // to keep waiting or assume idle. Cheap query; only on the timeout
     // branch since the replied branch carries the actual message.
     const peersDrafting = getOtherPeersDrafting(config, targetThread, self);
+    bumpCounter('wait_reply.timeouts');
+    if (peersDrafting.length > 0) bumpCounter('wait_reply.peer_drafting_observed');
     recordAudit('synapse_wait_reply', self, targetThread, { messageId }, 'allowed', 'timeout');
     return json({
       status: 'timeout',
@@ -1139,6 +1149,7 @@ server.registerTool(
   },
   async ({ limit }) => {
     const self = requireSelf();
+    bumpCounter('threads_visible.calls');
     return json({ threads: listVisibleThreads(config, self, limit ?? 50) });
   },
 );
@@ -1166,16 +1177,20 @@ server.registerTool(
 server.registerTool(
   'synapse_audit',
   {
-    title: 'List Audit Log',
-    description: 'Provenance audit log of synapse tool calls. Filter by thread or caller.',
+    title: 'List Audit Log / Counters',
+    description: 'Provenance + observability surface. Default (format omitted or "log"): returns audit log entries filtered by thread or caller — useful for debugging cross-peer messaging issues, identifying thread fragmentation, and tracing message routing. Set format="counters" to instead return §7 in-memory observability counters (bootstrap, heartbeat, send/reply integrity, wait/poll behavior, identityBindings) plus daemon uptime — useful for operator-side health checks and verifying success-criteria adherence at runtime.',
     inputSchema: z.object({
-      threadId: z.string().optional(),
-      callerId: z.string().optional(),
-      limit: z.number().int().positive().max(500).optional(),
+      threadId: z.string().optional().describe('Filter audit log by thread (log format only).'),
+      callerId: z.string().optional().describe('Filter audit log by caller peer (log format only).'),
+      limit: z.number().int().positive().max(500).optional().describe('Max audit entries (log format only).'),
+      format: z.enum(['log', 'counters']).optional().describe('Output shape: "log" (default) for audit entries, "counters" for §7 observability metrics.'),
     }),
   },
-  async ({ threadId, callerId, limit }) => {
+  async ({ threadId, callerId, limit, format }) => {
     requireSelf();
+    if (format === 'counters') {
+      return json(countersSnapshot());
+    }
     return json({ entries: listAudit(config, { threadId, callerId, limit }) });
   },
 );
@@ -1411,6 +1426,7 @@ server.registerTool(
   // Also gives Claude Desktop auto-register parity without needing a
   // desktop-side SessionStart hook: as long as SYNAPSE_LABEL is in the
   // MCP config env, the peer is live the moment the server boots.
+  bumpCounter('bootstrap.startup_fires');
   tryAdoptOrBootstrap();
 
   // Heartbeat — touch self peer row + active-file mtime periodically
@@ -1423,7 +1439,8 @@ server.registerTool(
     const HEARTBEAT_INTERVAL_MS = 30_000;
     const timer = setInterval(() => {
       if (!selfId) return;
-      try { touchPeer(config, selfId); }
+      bumpCounter('heartbeat.fires');
+      try { touchPeer(config, selfId); bumpCounter('heartbeat.peer_touches'); }
       catch { /* best-effort */ }
       if (selfLabel && selfSessionId) {
         try { stampMcpPidIntoActiveFile(selfLabel, selfSessionId); }
