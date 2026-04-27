@@ -149,6 +149,15 @@ export interface PollOptions {
   since?: string;
   unreadOnly?: boolean;
   workspace?: string;
+  // v7.1 #1 — auto-mark returned messages read in the same call. Default
+  // true: a peer that calls synapse_poll has, by definition, seen those
+  // messages, so the read_at flip belongs here rather than in a separate
+  // ack pass. Pass false for "preview without ack" use cases (debugging,
+  // synapse_audit-style introspection). Without this, hooks reading DB
+  // state directly (PreToolUse / PostToolUse markers) keep counting
+  // already-seen messages until the next synapse_send/reply, which
+  // produces the count saturation bug.
+  markRead?: boolean;
 }
 
 export function pollInbox(
@@ -157,7 +166,7 @@ export function pollInbox(
   opts: PollOptions = {},
 ): Message[] {
   pruneExpired(config);
-  const { since, unreadOnly = true, workspace } = opts;
+  const { since, unreadOnly = true, workspace, markRead = true } = opts;
 
   // Inbox visibility:
   //   1. Direct: to_id = self
@@ -196,7 +205,7 @@ export function pollInbox(
     params.push(workspace);
   }
 
-  return getDb(config).prepare(`
+  const messages = getDb(config).prepare(`
     SELECT id,
            from_id    AS fromId,
            to_id      AS toId,
@@ -210,6 +219,29 @@ export function pollInbox(
     WHERE ${where.join(' AND ')}
     ORDER BY created_at ASC
   `).all(...params) as unknown as Message[];
+
+  // v7.1 #1 — flip read_at on the rows we just returned. Only for rows
+  // currently NULL so we don't churn already-acked timestamps when
+  // unreadOnly=false is used to re-fetch within TTL. Single statement
+  // with parameterized id list; row count is bounded by inbox size so
+  // the IN-list stays small.
+  if (markRead && messages.length > 0) {
+    const unreadIds = messages.filter(m => m.readAt == null).map(m => m.id);
+    if (unreadIds.length > 0) {
+      const placeholders = unreadIds.map(() => '?').join(',');
+      const now = new Date().toISOString();
+      getDb(config).prepare(
+        `UPDATE messages SET read_at = ? WHERE id IN (${placeholders}) AND read_at IS NULL`,
+      ).run(now, ...unreadIds);
+      // Reflect the flip on the in-flight return objects so the caller
+      // sees the same state as the DB.
+      for (const m of messages) {
+        if (unreadIds.includes(m.id)) m.readAt = now;
+      }
+    }
+  }
+
+  return messages;
 }
 
 export interface InboxHead {
