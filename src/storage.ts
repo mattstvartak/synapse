@@ -6,7 +6,7 @@ import type {
   ThreadParticipant,
 } from './types.js';
 import { buildIdentityPaths } from './types.js';
-import { INIT_SCHEMA_SQL } from './schema.js';
+import { INIT_SCHEMA_SQL, COLUMN_MIGRATIONS } from './schema.js';
 
 let db: DatabaseSync | null = null;
 
@@ -23,6 +23,25 @@ export function getDb(config: SynapseConfig): DatabaseSync {
 
 function initSchema(d: DatabaseSync): void {
   d.exec(INIT_SCHEMA_SQL);
+  // Apply additive column migrations for dbs initialized against older
+  // schema versions. PRAGMA table_info returns one row per column; if
+  // the target column isn't present, run the ALTER. ALTER ADD COLUMN is
+  // safe under concurrent readers in WAL mode (sqlite acquires a brief
+  // exclusive lock; ongoing reads see the old shape until commit).
+  for (const m of COLUMN_MIGRATIONS) {
+    const cols = d.prepare(`PRAGMA table_info(${m.table})`).all() as Array<{ name: string }>;
+    if (cols.length === 0) continue; // table itself doesn't exist yet — CREATE will have handled it above
+    const has = cols.some(c => c.name === m.column);
+    if (!has) {
+      try { d.exec(m.alterSql); }
+      catch (err) {
+        // Best-effort. If migration fails (e.g. concurrent migrator),
+        // log and continue — the column may already be present and a
+        // double-add is the most likely error.
+        process.stderr.write(`synapse: schema migration ${m.table}.${m.column} failed: ${(err as Error).message}\n`);
+      }
+    }
+  }
 }
 
 // node:sqlite uses $name for named params (vs better-sqlite3's @name).
@@ -482,20 +501,43 @@ export function listMyThreads(
   return (rows as Array<{ threadId: string }>).map(r => r.threadId);
 }
 
+// §4.7 capability advertising — peer announces what kinds of work it
+// can route. Stored as a JSON array on peers.capabilities. Senders use
+// it to disambiguate when multiple peers share a label, and §4.8/§5.5
+// gate behaviors on specific capability tags (e.g. supports_drafting_signal,
+// dialect_v0).
+export function setPeerCapabilities(
+  config: SynapseConfig,
+  peerId: string,
+  tags: string[],
+): void {
+  // Dedupe + sort for stable comparisons across peers.
+  const cleaned = Array.from(new Set(tags.filter(t => typeof t === 'string' && t.length > 0))).sort();
+  const json = cleaned.length > 0 ? JSON.stringify(cleaned) : null;
+  getDb(config).prepare(
+    `UPDATE peers SET capabilities = ? WHERE id = ?`,
+  ).run(json, peerId);
+}
+
 // §4.8 typing presence. A peer announces "I'm drafting on thread X, ETA Ys"
 // so wait_reply callers know whether to keep waiting. Auto-cleared by the
 // next synapse_send/reply from the same peer on the same thread (the act
 // of sending IS the "done drafting" signal).
+
+export type DraftingSource = 'voluntary' | 'implicit';
 
 export interface DraftingState {
   threadId: string;
   peerId: string;
   startedAt: string;
   etaAt: string | null;
+  source: DraftingSource;
   startedAgeSec: number;
   etaInSec: number | null;
 }
 
+// Voluntary set — explicit synapse_set_drafting call. Always overwrites
+// any prior row for this (thread, peer), including implicit ones.
 export function setDrafting(
   config: SynapseConfig,
   threadId: string,
@@ -507,11 +549,34 @@ export function setDrafting(
     ? new Date(now.getTime() + etaSec * 1000).toISOString()
     : null;
   getDb(config).prepare(`
-    INSERT INTO drafting_state (thread_id, peer_id, started_at, eta_at)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO drafting_state (thread_id, peer_id, started_at, eta_at, source)
+    VALUES (?, ?, ?, ?, 'voluntary')
+    ON CONFLICT(thread_id, peer_id) DO UPDATE SET
+      started_at = excluded.started_at,
+      eta_at     = excluded.eta_at,
+      source     = 'voluntary'
+  `).run(threadId, peerId, now.toISOString(), etaAt);
+}
+
+// §4.8 implicit drafting — peer touched a thread-read tool. Tagged so
+// consumers know it's heuristic-grade. Default TTL is short (60s) since
+// "looked at thread" is a weak signal. Does NOT downgrade an existing
+// voluntary row — voluntary always wins.
+export function markImplicitDrafting(
+  config: SynapseConfig,
+  threadId: string,
+  peerId: string,
+  ttlSec = 60,
+): void {
+  const now = new Date();
+  const etaAt = new Date(now.getTime() + ttlSec * 1000).toISOString();
+  getDb(config).prepare(`
+    INSERT INTO drafting_state (thread_id, peer_id, started_at, eta_at, source)
+    VALUES (?, ?, ?, ?, 'implicit')
     ON CONFLICT(thread_id, peer_id) DO UPDATE SET
       started_at = excluded.started_at,
       eta_at     = excluded.eta_at
+      WHERE drafting_state.source = 'implicit'
   `).run(threadId, peerId, now.toISOString(), etaAt);
 }
 
@@ -528,20 +593,27 @@ export function clearDrafting(
 
 // Drafting state for all peers currently drafting on a thread, EXCLUDING
 // the caller. The caller's own drafting state isn't useful to itself.
+// Filters expired rows (eta_at past) so consumers don't see ghost flags
+// from agents that polled-and-then-walked-away. Implicit-source flags
+// always carry an eta_at so this filter cleans them up automatically.
 export function getOtherPeersDrafting(
   config: SynapseConfig,
   threadId: string,
   excludePeerId: string,
 ): DraftingState[] {
+  const nowIso = new Date().toISOString();
   const rows = getDb(config).prepare(`
     SELECT thread_id  AS threadId,
            peer_id    AS peerId,
            started_at AS startedAt,
-           eta_at     AS etaAt
+           eta_at     AS etaAt,
+           source     AS source
     FROM drafting_state
     WHERE thread_id = ? AND peer_id != ?
-  `).all(threadId, excludePeerId) as Array<{
-    threadId: string; peerId: string; startedAt: string; etaAt: string | null;
+      AND (eta_at IS NULL OR eta_at >= ?)
+  `).all(threadId, excludePeerId, nowIso) as Array<{
+    threadId: string; peerId: string; startedAt: string;
+    etaAt: string | null; source: string;
   }>;
 
   const now = Date.now();
@@ -550,6 +622,7 @@ export function getOtherPeersDrafting(
     peerId: r.peerId,
     startedAt: r.startedAt,
     etaAt: r.etaAt,
+    source: (r.source === 'implicit' ? 'implicit' : 'voluntary') as DraftingSource,
     startedAgeSec: Math.floor((now - new Date(r.startedAt).getTime()) / 1000),
     etaInSec: r.etaAt
       ? Math.max(0, Math.floor((new Date(r.etaAt).getTime() - now) / 1000))

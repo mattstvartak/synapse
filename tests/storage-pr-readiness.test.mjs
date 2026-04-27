@@ -16,6 +16,7 @@ import { join } from 'node:path';
 
 import {
   upsertPeer,
+  getPeer,
   insertMessage,
   joinThread,
   findRecentSharedThread,
@@ -23,8 +24,10 @@ import {
   pollInboxHead,
   listVisibleThreads,
   setDrafting,
+  markImplicitDrafting,
   clearDrafting,
   getOtherPeersDrafting,
+  setPeerCapabilities,
 } from '../dist/storage.js';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'synapse-pr-test-'));
@@ -379,4 +382,71 @@ test('clearDrafting: removes the row', () => {
 test('clearDrafting: returns false when nothing to clear', () => {
   const cleared = clearDrafting(config, 't-nonexistent', 'cowork-nope');
   assert.equal(cleared, false);
+});
+
+// §4.7 capability advertising
+test('setPeerCapabilities: dedupes + sorts + persists', () => {
+  const PEER = 'code-cap1';
+  upsertPeer(config, { id: PEER, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setPeerCapabilities(config, PEER, ['fs', 'git', 'fs', 'browser']);
+  const peer = getPeer(config, PEER);
+  assert.equal(peer.capabilities, JSON.stringify(['browser', 'fs', 'git']));
+});
+
+test('setPeerCapabilities: empty array clears to NULL', () => {
+  const PEER = 'code-cap2';
+  upsertPeer(config, { id: PEER, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setPeerCapabilities(config, PEER, ['x']);
+  setPeerCapabilities(config, PEER, []);
+  const peer = getPeer(config, PEER);
+  assert.equal(peer.capabilities, null);
+});
+
+// §4.8 implicit drafting
+test('markImplicitDrafting: visible to other peer with source=implicit', () => {
+  const PEER_DRAFT = 'cowork-impl1';
+  upsertPeer(config, { id: PEER_DRAFT, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  markImplicitDrafting(config, 't-impl-1', PEER_DRAFT, 60);
+  const fromOther = getOtherPeersDrafting(config, 't-impl-1', 'code-other');
+  assert.equal(fromOther.length, 1);
+  assert.equal(fromOther[0].peerId, PEER_DRAFT);
+  assert.equal(fromOther[0].source, 'implicit');
+  assert.ok(fromOther[0].etaInSec !== null);
+  assert.ok(fromOther[0].etaInSec <= 60);
+});
+
+test('markImplicitDrafting: expired rows filtered out', () => {
+  const PEER_DRAFT = 'cowork-impl2';
+  upsertPeer(config, { id: PEER_DRAFT, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  // ttlSec=0 → eta_at = now → already expired
+  markImplicitDrafting(config, 't-impl-2', PEER_DRAFT, 0);
+  // Tiny sleep to push eta_at into the past for sure.
+  const start = Date.now();
+  while (Date.now() - start < 50) { /* spin briefly */ }
+  const fromOther = getOtherPeersDrafting(config, 't-impl-2', 'code-other');
+  assert.equal(fromOther.length, 0);
+});
+
+test('voluntary setDrafting overrides implicit on same (thread, peer)', () => {
+  const PEER = 'cowork-impl3';
+  upsertPeer(config, { id: PEER, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  markImplicitDrafting(config, 't-impl-3', PEER, 60);
+  setDrafting(config, 't-impl-3', PEER, 120);
+  const fromOther = getOtherPeersDrafting(config, 't-impl-3', 'code-other');
+  assert.equal(fromOther.length, 1);
+  assert.equal(fromOther[0].source, 'voluntary');
+  assert.ok(fromOther[0].etaInSec >= 110);
+});
+
+test('implicit markImplicitDrafting does NOT downgrade voluntary', () => {
+  const PEER = 'cowork-impl4';
+  upsertPeer(config, { id: PEER, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setDrafting(config, 't-impl-4', PEER, 300);
+  // Now an implicit signal arrives — should NOT downgrade.
+  markImplicitDrafting(config, 't-impl-4', PEER, 30);
+  const fromOther = getOtherPeersDrafting(config, 't-impl-4', 'code-other');
+  assert.equal(fromOther.length, 1);
+  assert.equal(fromOther[0].source, 'voluntary');
+  // ETA should still be ~300s, not the implicit's 30s.
+  assert.ok(fromOther[0].etaInSec >= 250);
 });

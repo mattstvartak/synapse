@@ -78,13 +78,38 @@ export const INIT_SCHEMA_SQL = `
   -- thread X, ETA Y seconds" so wait_reply callers know whether to keep
   -- waiting or assume the peer is idle. Rows are short-lived; auto-cleared
   -- on next synapse_send/reply by the same peer on the same thread, or
-  -- explicitly via synapse_clear_drafting, or by TTL when the daemon
-  -- next prunes (see clearStaleDrafting in storage.ts).
+  -- explicitly via synapse_clear_drafting, or by TTL.
+  --
+  -- The 'source' column tags origin: 'voluntary' (synapse_set_drafting
+  -- explicit call) vs 'implicit' (inferred from a thread-read tool —
+  -- synapse_thread / synapse_thread_state / synapse_thread_participants —
+  -- with short TTL). Consumers see source in the wait_reply payload and
+  -- can weight trust. Voluntary overrides implicit on conflict.
   CREATE TABLE IF NOT EXISTS drafting_state (
     thread_id  TEXT NOT NULL,
     peer_id    TEXT NOT NULL,
     started_at TEXT NOT NULL,
     eta_at     TEXT,
+    source     TEXT NOT NULL DEFAULT 'voluntary',
     PRIMARY KEY (thread_id, peer_id)
   );
 `;
+
+// Schema migrations for databases initialized against an older
+// INIT_SCHEMA_SQL. CREATE TABLE IF NOT EXISTS is idempotent for FRESH
+// dbs but won't add columns to existing tables. Each migration entry is
+// a column-add probe via PRAGMA table_info + an ALTER TABLE if missing.
+// Run after the initial schema execution in initSchema().
+export interface ColumnMigration {
+  table: string;
+  column: string;
+  alterSql: string;
+}
+
+export const COLUMN_MIGRATIONS: ColumnMigration[] = [
+  {
+    table: 'drafting_state',
+    column: 'source',
+    alterSql: `ALTER TABLE drafting_state ADD COLUMN source TEXT NOT NULL DEFAULT 'voluntary'`,
+  },
+];

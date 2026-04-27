@@ -15,7 +15,8 @@ import {
   logAudit, listAudit,
   joinThread, leaveThread, listThreadParticipants, listMyThreads,
   listVisibleThreads,
-  setDrafting, clearDrafting, getOtherPeersDrafting,
+  setDrafting, clearDrafting, markImplicitDrafting, getOtherPeersDrafting,
+  setPeerCapabilities,
   listActiveFiles, classifyActiveFile, deleteActiveFile,
   findActiveFileDuplicates,
   dropPeersExcept,
@@ -481,18 +482,37 @@ server.registerTool(
   'synapse_send',
   {
     title: 'Send Message',
-    description: 'Send a message to a peer ID or "broadcast". Returns messageId, threadId, and a `suggestedNext` hint pointing at synapse_wait_reply — chain into it to receive the reply without going idle.',
+    description: 'Send a message to a peer ID or "broadcast". Returns messageId, threadId, pendingInbound (§5.6(a)), and a `suggestedNext` hint pointing at synapse_wait_reply. Set strict_inbox=true (§5.6(b)) to refuse the send when unseen inbound exists, forcing digest-before-send.',
     inputSchema: z.object({
       to: z.string().describe('Target peer ID (from synapse_peers) or "broadcast".'),
       body: z.string().describe('Message body (markdown ok).'),
       threadId: z.string().optional().describe('Existing thread to join. Otherwise a new thread is created.'),
       workspace: z.string().optional().describe('Optional workspace tag for filtering.'),
       ttlSeconds: z.number().optional().describe('Override default 24h TTL.'),
+      strict_inbox: z.boolean().optional().describe('§5.6(b) — when true, the send is REFUSED with INBOX_NOT_DRAINED if any inbound is pending after auto-ack. Sender must call synapse_poll, digest, then retry. For high-stakes threads where stale-context cannot be tolerated. Default false.'),
     }),
   },
-  async ({ to, body, threadId, workspace, ttlSeconds }) => {
+  async ({ to, body, threadId, workspace, ttlSeconds, strict_inbox }) => {
     const from = requireSelf();
     touchPeer(config, from);
+
+    // §5.6(b) strict_inbox — check BEFORE insertMessage so a refused
+    // send doesn't pollute the audit log with a "sent then warned"
+    // trace. Auto-ack first (§5.6(d)) so the strict check counts only
+    // truly-unseen messages, not messages the agent just polled.
+    if (strict_inbox) {
+      ackRecentlySeen();
+      const pending = computePendingInbound(from);
+      if (pending.count > 0) {
+        recordAudit('synapse_send', from, threadId ?? null, { to, strict_inbox: true }, 'blocked', `INBOX_NOT_DRAINED count=${pending.count}`);
+        throw new Error(
+          `INBOX_NOT_DRAINED: ${pending.count} unseen inbound message${pending.count === 1 ? '' : 's'} ` +
+          `from peer${pending.fromPeerIds.length === 1 ? '' : 's'} ${pending.fromPeerIds.join(', ')} ` +
+          `(oldest ${pending.oldestUnreadAgeSec ?? '?'}s ago). Call synapse_poll, digest, then retry. ` +
+          `To bypass this gate, omit strict_inbox.`,
+        );
+      }
+    }
 
     // Thread-fragmentation guard. When the caller addresses a peer
     // directly (not "broadcast", not "thread:<id>") and provides no
@@ -673,18 +693,37 @@ server.registerTool(
   'synapse_reply',
   {
     title: 'Reply on Thread',
-    description: 'Reply to a message. Auto-routes to the original sender on the same thread. Returns a `suggestedNext` hint pointing at synapse_wait_reply — chain into it to receive the next reply without going idle.',
+    description: 'Reply to a message. Auto-routes to the original sender on the same thread. Returns pendingInbound (§5.6(a)) and a `suggestedNext` hint pointing at synapse_wait_reply. Set strict_inbox=true (§5.6(b)) to refuse the reply when unseen inbound exists.',
     inputSchema: z.object({
       messageId: z.string().describe('Message to reply to.'),
       body: z.string(),
       ttlSeconds: z.number().optional(),
+      strict_inbox: z.boolean().optional().describe('§5.6(b) — when true, refuses the reply with INBOX_NOT_DRAINED if any inbound is pending after auto-ack of parent + previously-seen messages. Default false.'),
     }),
   },
-  async ({ messageId, body, ttlSeconds }) => {
+  async ({ messageId, body, ttlSeconds, strict_inbox }) => {
     const self = requireSelf();
     touchPeer(config, self);
     const parent = getMessage(config, messageId);
     if (!parent) throw new Error(`Message ${messageId} not found.`);
+
+    // §5.6(b) strict_inbox — same shape as synapse_send. Pre-ack the
+    // parent (replier obviously saw it) plus recently-seen messages so
+    // the strict gate counts only truly-unseen inbound.
+    if (strict_inbox) {
+      try { ackMessage(config, parent.id); } catch { /* best-effort */ }
+      ackRecentlySeen();
+      const pending = computePendingInbound(self);
+      if (pending.count > 0) {
+        recordAudit('synapse_reply', self, parent.threadId, { parentId: parent.id, strict_inbox: true }, 'blocked', `INBOX_NOT_DRAINED count=${pending.count}`);
+        throw new Error(
+          `INBOX_NOT_DRAINED: ${pending.count} unseen inbound message${pending.count === 1 ? '' : 's'} ` +
+          `from peer${pending.fromPeerIds.length === 1 ? '' : 's'} ${pending.fromPeerIds.join(', ')} ` +
+          `(oldest ${pending.oldestUnreadAgeSec ?? '?'}s ago). Call synapse_poll, digest, then retry. ` +
+          `To bypass this gate, omit strict_inbox.`,
+        );
+      }
+    }
 
     const cap = checkAndCountAuto(parent.threadId, self, body);
     if (!cap.allowed) {
@@ -743,7 +782,10 @@ server.registerTool(
     }),
   },
   async ({ threadId }) => {
-    requireSelf();
+    const self = requireSelf();
+    // §4.8 implicit drafting — peer is examining the thread, infer
+    // intent-to-respond. Short TTL (60s); auto-cleared by send/reply.
+    markImplicitDrafting(config, threadId, self, 60);
     return json({ messages: getThread(config, threadId) });
   },
 );
@@ -869,6 +911,27 @@ server.registerTool(
     touchPeer(config, self);
     setDrafting(config, threadId, self, etaSec ?? null);
     return json({ ok: true, threadId, peerId: self, etaSec: etaSec ?? null });
+  },
+);
+
+// ── synapse_register_capabilities ─────────────────────────────────
+
+server.registerTool(
+  'synapse_register_capabilities',
+  {
+    title: 'Advertise Capabilities',
+    description: 'Set this peer\'s capability tags so senders can route by capability instead of label. Examples: "code", "browser", "figma", "fs", "git", "supports_drafting_signal", "dialect_v0". Tags are surfaced via synapse_peers and inform §4.8 / §5.5 / future routing logic. Idempotent — call again to overwrite.',
+    inputSchema: z.object({
+      tags: z.array(z.string().min(1).max(64)).max(32).describe('Capability tags. Deduplicated server-side and stored sorted for stable comparison. Pass [] to clear.'),
+    }),
+  },
+  async ({ tags }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    setPeerCapabilities(config, self, tags);
+    // Echo the cleaned + sorted set back so callers can verify.
+    const cleaned = Array.from(new Set(tags)).sort();
+    return json({ ok: true, peerId: self, capabilities: cleaned });
   },
 );
 
@@ -1004,7 +1067,9 @@ server.registerTool(
     inputSchema: z.object({ threadId: z.string() }),
   },
   async ({ threadId }) => {
-    requireSelf();
+    const self = requireSelf();
+    // §4.8 implicit drafting — peer is examining the thread.
+    markImplicitDrafting(config, threadId, self, 60);
     const thread = getThreadState(config, threadId);
     return json({ thread });
   },
@@ -1088,7 +1153,10 @@ server.registerTool(
     inputSchema: z.object({ threadId: z.string() }),
   },
   async ({ threadId }) => {
-    requireSelf();
+    const self = requireSelf();
+    // §4.8 implicit drafting — peer is examining the thread roster,
+    // a strong signal of intent-to-engage.
+    markImplicitDrafting(config, threadId, self, 60);
     return json({ participants: listThreadParticipants(config, threadId) });
   },
 );
