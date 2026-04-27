@@ -1000,6 +1000,80 @@ export function deleteActiveFile(info: ActiveFileInfo): boolean {
   catch { return false; }
 }
 
+// ── Phantom-peer detection (v7 auto-comms B + #2) ─────────────────
+// A peer-id is "live" iff it has at least one active-<label>-*.json
+// authored by an actual shim (source != 'session-start-hook-fallback')
+// with a live mcpPid. Hook-fallback-only files are heartbeats from the
+// SessionStart hook with no MCP transport behind them — they pollute
+// synapse_peers and waste sends. Returns a structured reason so callers
+// can surface PEER_PHANTOM / PEER_STALE / PEER_ORPHAN.
+
+export interface PeerLivenessSummary {
+  live: boolean;
+  reason: 'live' | 'phantom' | 'stale' | 'orphan';
+  detail?: string;
+}
+
+export function peerLivenessSummary(
+  config: SynapseConfig,
+  peerId: string,
+): PeerLivenessSummary {
+  const owned = listActiveFiles(config).filter(f => f.parsed?.id === peerId);
+  if (owned.length === 0) {
+    return { live: false, reason: 'orphan', detail: 'no active-file on disk' };
+  }
+
+  owned.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  // Live iff at least one shim-sourced file has a live mcpPid. Multiple
+  // files may coexist during identity rotation; any single live one wins.
+  const liveFile = owned.find(f =>
+    f.parsed?.source !== 'session-start-hook-fallback'
+    && f.parsed?.mcpPid != null
+    && isPidAlive(f.parsed.mcpPid),
+  );
+  if (liveFile) return { live: true, reason: 'live' };
+
+  // Not live — classify by the freshest file's defect for an actionable error.
+  const top = owned[0];
+  const src = top.parsed?.source;
+  const pid = top.parsed?.mcpPid;
+
+  if (src === 'session-start-hook-fallback') {
+    return {
+      live: false,
+      reason: 'phantom',
+      detail: `only active-file is hook-fallback (${top.name})`,
+    };
+  }
+  if (pid != null && !isPidAlive(pid)) {
+    return { live: false, reason: 'stale', detail: `mcpPid ${pid} dead` };
+  }
+  if (pid == null) {
+    return { live: false, reason: 'stale', detail: 'no mcpPid recorded' };
+  }
+  return { live: false, reason: 'stale', detail: 'unknown defect' };
+}
+
+// Suggest a fresh candidate peer id sharing the given label, used in
+// PEER_PHANTOM/PEER_STALE error bodies so callers can re-target. Excludes
+// the given ids — callers pass both the failed target AND themselves so
+// the hint never resolves to "try yourself." Returns null if no other
+// live peer matches.
+export function suggestLivePeerForLabel(
+  config: SynapseConfig,
+  label: string,
+  excludeIds: readonly string[],
+): string | null {
+  const exclude = new Set(excludeIds);
+  const candidates = listActivePeers(config)
+    .filter(p => p.label === label && !exclude.has(p.id));
+  for (const c of candidates) {
+    if (peerLivenessSummary(config, c.id).live) return c.id;
+  }
+  return null;
+}
+
 // True when the active file's name matches the v1.2+ canonical pattern
 // `active-<label>-<sessionId>.json` where the discriminator is a UUID
 // (not a small integer ppid). Used to prefer sessionId-keyed files over

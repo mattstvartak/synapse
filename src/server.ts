@@ -19,6 +19,7 @@ import {
   setPeerCapabilities, addPeerCapabilities, removePeerCapabilities,
   resolvePeerAlias,
   listActiveFiles, classifyActiveFile, deleteActiveFile,
+  peerLivenessSummary, suggestLivePeerForLabel,
   findActiveFileDuplicates,
   dropPeersExcept,
   findRecentSharedThread,
@@ -517,6 +518,61 @@ server.registerTool(
       }
     }
 
+    // §1.8 — reject self-loopback on synapse_send. The §1.6 alias
+    // resolution above can rewrite a stale peer-id to the caller's
+    // current id; without this guard the message lands in the sender's
+    // own inbox (own outbound = own inbound). Mirrors the synapse_reply
+    // self-loopback block at line ~744. Exempt by construction:
+    // broadcast and thread:<id> addresses skip the alias block, so
+    // resolvedTo can only equal `from` for direct peer-id addressing
+    // that the alias chain rewrote back to caller.
+    if (resolvedTo === from) {
+      recordAudit('synapse_send', from, threadId ?? null, { to_alias: to, to_resolved: resolvedTo }, 'blocked', 'INVALID_SEND_TARGET self-loopback');
+      bumpCounter('send.self_loopback_blocks');
+      throw new Error(
+        `INVALID_SEND_TARGET: cannot send to yourself. ` +
+        `Address "${to}" resolved to caller (${from}) via §1.6 alias rewrite — ` +
+        `the requested peer-id is a stale alias for your own current identity. ` +
+        `Use a different peer ID, "broadcast", or "thread:<threadId>" if you intend to fan out to a roster.`,
+      );
+    }
+
+    // B + #2 — reject sends to phantom or stale peers. After alias
+    // resolution we know resolvedTo is a single peer-id; if its
+    // active-file is hook-fallback only, its mcpPid is dead, or it
+    // has no active-file at all, the message will land in a mailbox
+    // no live session is polling. Refuse with a structured error so
+    // the caller can re-target. Broadcast and thread:<id> bypass —
+    // recipients are resolved at fan-out time and any live participant
+    // on the thread will receive the message.
+    if (resolvedTo !== 'broadcast' && !isThreadAddress(resolvedTo)) {
+      const liveness = peerLivenessSummary(config, resolvedTo);
+      if (!liveness.live) {
+        const targetPeer = getPeer(config, resolvedTo);
+        const candidate = targetPeer
+          ? suggestLivePeerForLabel(config, targetPeer.label, [resolvedTo, from])
+          : null;
+        const errCode =
+          liveness.reason === 'phantom' ? 'PEER_PHANTOM' :
+          liveness.reason === 'orphan' ? 'PEER_ORPHAN' :
+          'PEER_STALE';
+        recordAudit(
+          'synapse_send', from, threadId ?? null,
+          { to_alias: to, to_resolved: resolvedTo, liveness_reason: liveness.reason, liveness_detail: liveness.detail ?? null },
+          'blocked',
+          `${errCode} ${liveness.detail ?? ''}`.trim(),
+        );
+        bumpCounter(`send.${liveness.reason}_blocks`);
+        const tail = candidate
+          ? `Try ${candidate} instead, or "broadcast" / "thread:<id>" to fan out.`
+          : `Use "broadcast" or "thread:<id>" to fan out, or wait for a live peer to surface.`;
+        throw new Error(
+          `${errCode}: target ${resolvedTo} has no live MCP transport ` +
+          `(${liveness.detail ?? liveness.reason}). ${tail}`,
+        );
+      }
+    }
+
     // §5.6(b) strict_inbox — check BEFORE insertMessage so a refused
     // send doesn't pollute the audit log with a "sent then warned"
     // trace. Auto-ack first (§5.6(d)) so the strict check counts only
@@ -632,7 +688,7 @@ server.registerTool(
   'synapse_poll',
   {
     title: 'Poll Inbox',
-    description: 'Returns messages where to == self OR (to == "broadcast" AND from != self). Auto-touches peer heartbeat. Response includes `serverHealth` with the server\'s pid and current timestamp — clients comparing this across calls can detect MCP transport health.',
+    description: 'Returns messages where to == self OR (to == "broadcast" AND from != self) OR (to == "thread:<id>" AND self is a participant). Auto-touches peer heartbeat. Toid is canonicalized on insert via §1.6 alias resolution — if a sender addressed your stale peer-id, the message is stored under your current canonical id and surfaces here normally; the original alias is preserved in the audit log under `to_alias`. Response includes `serverHealth` with the server\'s pid and current timestamp — clients comparing this across calls can detect MCP transport health.',
     inputSchema: z.object({
       since: z.string().optional().describe('ISO timestamp; only messages after this. Default: returns all unread.'),
       unreadOnly: z.boolean().optional().describe('Default true. Set false to include already-read messages within TTL.'),
@@ -840,7 +896,7 @@ server.registerTool(
   'synapse_peers',
   {
     title: 'List Active Peers',
-    description: 'Peers seen within the heartbeat window (default 10 min). Excludes self.',
+    description: 'Peers seen within the heartbeat window (default 10 min) AND with a live MCP transport. Excludes self. Phantom peers (active-file is session-start-hook-fallback only, no shim-source file) and stale peers (mcpPid dead) are filtered out — they pollute the list and waste sends. Filtered count is recorded under counter `peers.phantom_filtered`.',
     inputSchema: z.object({}),
   },
   async () => {
@@ -850,14 +906,24 @@ server.registerTool(
     // peers tool doesn't return self=null on first call.
     tryAdoptOrBootstrap();
     const all = listActivePeers(config);
-    const peers = all
-      .filter(p => p.id !== selfId)
-      .map(p => ({
+    // B + #2 — phantom/stale-peer filter. A peer with only a hook-fallback
+    // active file or a dead mcpPid has no MCP transport; addressing it
+    // routes to a mailbox no one polls. Drop from listing, surface count
+    // via counter so we can detect leaky shutdown paths from telemetry.
+    const peers: Array<{ id: string; label: string; lastSeenAt: string; capabilities: string[] }> = [];
+    for (const p of all) {
+      if (p.id === selfId) continue;
+      if (!peerLivenessSummary(config, p.id).live) {
+        bumpCounter('peers.phantom_filtered');
+        continue;
+      }
+      peers.push({
         id: p.id,
         label: p.label,
         lastSeenAt: p.lastSeenAt,
         capabilities: p.capabilities ? JSON.parse(p.capabilities) as string[] : [],
-      }));
+      });
+    }
     return json({
       self: selfId ? { id: selfId, label: selfLabel } : null,
       peers,
