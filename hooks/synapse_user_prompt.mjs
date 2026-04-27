@@ -84,6 +84,52 @@ function findActiveFile(dataDir, label, sessionId, ppid, maxAgeMs) {
   return null;
 }
 
+// v7.1 #3 — cron-fired prompt detection. Cron tasks (/loop) re-fire a
+// stored prompt indefinitely; without this gate every fire writes
+// peer_busy_state=USER_DRIVEN, leaving the peer permanently "busy" so
+// recruit-prospect selection skips it forever. Detection vectors,
+// in priority order:
+//   (a) stdin payload `source` / `trigger` field, if Claude Code ever
+//       provides one (probed defensively in detectCronPrompt).
+//   (b) prompt-text marker matching known recurring patterns (the
+//       conservative default). False-positives keep the peer idle for
+//       one turn — benign cost. False-negatives reproduce the bug, so
+//       err toward broader matching.
+// When detected, busy_reason is written as 'CRON_ONLY' (storage-side
+// idle weight = 2, between NEVER_BUSY and EXPLICIT_IDLE) so prospect
+// selection can rank the peer as ranked-idle rather than exclude it.
+// Override via SYNAPSE_CRON_PROMPT_PATTERNS (comma-separated regexes).
+const DEFAULT_CRON_PATTERNS = [
+  /^poll\s+synapse(\s|\.|$)/i,
+  /^check\s+(synapse|messages|inbox|for\s+messages)\b/i,
+  /^(any\s+)?(new\s+)?messages?\??\s*$/i,
+];
+function loadCronPatterns() {
+  const raw = process.env.SYNAPSE_CRON_PROMPT_PATTERNS;
+  if (!raw) return DEFAULT_CRON_PATTERNS;
+  const parts = raw.split(',').map(s => s.trim()).filter(Boolean);
+  if (parts.length === 0) return DEFAULT_CRON_PATTERNS;
+  const out = [];
+  for (const p of parts) {
+    try { out.push(new RegExp(p, 'i')); } catch { /* skip malformed */ }
+  }
+  return out.length > 0 ? out : DEFAULT_CRON_PATTERNS;
+}
+function detectCronPrompt(payload) {
+  if (!payload) return false;
+  // (a) defensive — Claude Code may eventually populate a source field.
+  const src = payload.source ?? payload.trigger ?? null;
+  if (typeof src === 'string') {
+    const s = src.toLowerCase();
+    if (s === 'cron' || s === 'cron_create' || s === 'scheduled') return true;
+  }
+  // (b) prompt-text match.
+  const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
+  if (!prompt) return false;
+  const patterns = loadCronPatterns();
+  return patterns.some(rx => rx.test(prompt));
+}
+
 const label = parseLabel();
 const dataDir = process.env.SYNAPSE_DATA_DIR ?? join(homedir(), '.claude', 'synapse');
 const peerTimeoutSec = parseInt(process.env.SYNAPSE_PEER_TIMEOUT_SECONDS ?? '600', 10);
@@ -91,6 +137,7 @@ const PPID = process.ppid;
 const stdinPayload = readStdinJson();
 const sessionId = (stdinPayload && typeof stdinPayload.session_id === 'string')
   ? stdinPayload.session_id : null;
+const isCronPrompt = detectCronPrompt(stdinPayload);
 
 if (!label) emitNothing();
 
@@ -128,17 +175,24 @@ try {
   // §4.10 — mark this peer busy for the duration of the user turn so
   // recruit-prospect selection deprioritizes us. Stop hook clears the
   // row + appends an idle-event when the turn ends. Schema lives in
-  // peer_busy_state (added by Stage 8). busy_reason is free-form TEXT;
-  // hook convention is USER_DRIVEN for normal prompts. CRON_ONLY,
-  // EXPLICIT_BUSY, EXPLICIT_AWAY are reserved for tool-driven idle
-  // transitions (synapse_set_busy / synapse_set_idle).
+  // peer_busy_state (added by Stage 8). busy_reason is free-form TEXT.
+  // Hook conventions:
+  //   USER_DRIVEN — the user typed a prompt or pasted in content.
+  //   CRON_ONLY   — v7.1 #3: a /loop/cron job re-fired a stored prompt;
+  //                 still "active" but should NOT exclude from recruit
+  //                 selection (recurring poll loops would otherwise mask
+  //                 a peer as permanently busy and break auto-join).
+  //                 selectRecruitProspects treats CRON_ONLY busy_reason
+  //                 as ranked-idle rather than excluded.
+  //   EXPLICIT_BUSY / EXPLICIT_AWAY — set via synapse_set_busy.
+  const busyReason = isCronPrompt ? 'CRON_ONLY' : 'USER_DRIVEN';
   db.prepare(`
     INSERT INTO peer_busy_state (peer_id, busy_at, busy_reason, shim_fingerprint)
-    VALUES (?, ?, 'USER_DRIVEN', NULL)
+    VALUES (?, ?, ?, NULL)
     ON CONFLICT(peer_id) DO UPDATE SET
       busy_at     = excluded.busy_at,
       busy_reason = excluded.busy_reason
-  `).run(selfId, now);
+  `).run(selfId, now, busyReason);
 
   const heartbeatCutoff = new Date(Date.now() - peerTimeoutSec * 1000).toISOString();
   const messages = db.prepare(`

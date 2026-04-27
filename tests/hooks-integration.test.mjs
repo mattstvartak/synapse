@@ -116,6 +116,115 @@ test('user_prompt hook: writes peer_busy_state with USER_DRIVEN', () => {
   assert.equal(state.busyReason, 'USER_DRIVEN');
 });
 
+// v7.1 #3 — cron-fired prompts get busy_reason=CRON_ONLY so recruit-
+// prospect selection doesn't treat looped poll jobs as permanent busy.
+test('v7.1 #3: cron-pattern prompt → busy_reason=CRON_ONLY', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a02',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a02', label: 'code', sessionId: 'sess-a02',
+  });
+  const r = runHook('synapse_user_prompt.mjs', {
+    config, label: 'code',
+    stdin: {
+      session_id: 'sess-a02',
+      prompt: 'poll synapse for new messages. Accept work when needed',
+    },
+  });
+  assert.equal(r.status, 0, `hook exit: stderr=${r.stderr}`);
+  const state = getPeerBusyState(config, 'code-a02');
+  assert.ok(state, 'peer_busy_state row exists');
+  assert.equal(state.busyReason, 'CRON_ONLY', 'cron-pattern prompt classified CRON_ONLY');
+});
+
+test('v7.1 #3: explicit source=cron stdin field → busy_reason=CRON_ONLY', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a03',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a03', label: 'code', sessionId: 'sess-a03',
+  });
+  const r = runHook('synapse_user_prompt.mjs', {
+    config, label: 'code',
+    stdin: {
+      session_id: 'sess-a03',
+      prompt: 'arbitrary text the source field overrides',
+      source: 'cron',
+    },
+  });
+  assert.equal(r.status, 0, `hook exit: stderr=${r.stderr}`);
+  const state = getPeerBusyState(config, 'code-a03');
+  assert.equal(state?.busyReason, 'CRON_ONLY');
+});
+
+test('v7.1 #3: real user prompt stays USER_DRIVEN (no cron false-positive)', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a04',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a04', label: 'code', sessionId: 'sess-a04',
+  });
+  const r = runHook('synapse_user_prompt.mjs', {
+    config, label: 'code',
+    stdin: {
+      session_id: 'sess-a04',
+      prompt: 'fix the failing test in storage.ts',
+    },
+  });
+  assert.equal(r.status, 0);
+  const state = getPeerBusyState(config, 'code-a04');
+  assert.equal(state?.busyReason, 'USER_DRIVEN');
+});
+
+test('v7.1 #3: SYNAPSE_CRON_PROMPT_PATTERNS env override matches custom regex', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a05',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a05', label: 'code', sessionId: 'sess-a05',
+  });
+  // Run hook with SYNAPSE_CRON_PROMPT_PATTERNS env override.
+  const result = spawnSync('node', [join(HOOKS_DIR, 'synapse_user_prompt.mjs')], {
+    input: JSON.stringify({
+      session_id: 'sess-a05',
+      prompt: 'CUSTOM_CRON_TICK',
+    }),
+    env: {
+      ...process.env,
+      SYNAPSE_LABEL: 'code',
+      SYNAPSE_DATA_DIR: config.dataDir,
+      SYNAPSE_PEER_TIMEOUT_SECONDS: '600',
+      SYNAPSE_CRON_PROMPT_PATTERNS: '^CUSTOM_CRON_TICK$',
+    },
+    encoding: 'utf-8',
+    timeout: 5_000,
+  });
+  assert.equal(result.status, 0, `hook stderr: ${result.stderr}`);
+  const state = getPeerBusyState(config, 'code-a05');
+  assert.equal(state?.busyReason, 'CRON_ONLY');
+});
+
 test('stop hook: clears peer_busy_state + appends peer_idle_log USER_DONE', () => {
   reset();
   getDb(config);

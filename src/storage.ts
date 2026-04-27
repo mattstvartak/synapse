@@ -1541,7 +1541,10 @@ export function selectRecruitProspects(
     ? `AND p.id NOT IN (${criteria.excludeIds.map(() => '?').join(',')})`
     : '';
 
-  // Base query: heartbeat-fresh peers, not in busy table, not excluded.
+  // Base query: heartbeat-fresh peers, either fully idle (no busy row)
+  // or busy with reason='CRON_ONLY' (v7.1 #3 — recurring poll loops
+  // shouldn't mask a peer as permanently busy; treat them as ranked-
+  // idle so auto-join still considers them).
   const rows = getDb(config).prepare(`
     SELECT p.id            AS id,
            p.label          AS label,
@@ -1551,7 +1554,7 @@ export function selectRecruitProspects(
     FROM peers p
     LEFT JOIN peer_busy_state pbs ON pbs.peer_id = p.id
     WHERE p.last_seen_at >= ?
-      AND pbs.peer_id IS NULL
+      AND (pbs.peer_id IS NULL OR pbs.busy_reason = 'CRON_ONLY')
       ${excludeList}
   `).all(cutoff, ...criteria.excludeIds) as unknown as Peer[];
 

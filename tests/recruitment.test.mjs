@@ -424,6 +424,34 @@ test('v7.1 #2 fulfillMatchingRecruit: returns null when no recruits on thread', 
   assert.equal(matched, null);
 });
 
+// v7.1 #3 — selectRecruitProspects must include CRON_ONLY busy peers
+// (treats them as ranked-idle) so cron-loop poll jobs don't mask peers
+// from auto-join consideration.
+test('v7.1 #3 selectRecruitProspects: CRON_ONLY busy peer included as prospect', () => {
+  reset();
+  addPeer('code-cron-peer', 'code', ['code']);
+  // Mark the peer busy with reason='CRON_ONLY' (as the user_prompt hook
+  // would on a cron-pattern prompt).
+  setPeerBusy(config, 'code-cron-peer', 'CRON_ONLY');
+  const prospects = selectRecruitProspects(config, {
+    capabilities: ['code'],
+    excludeIds: [],
+  });
+  assert.equal(prospects.length, 1);
+  assert.equal(prospects[0].id, 'code-cron-peer');
+});
+
+test('v7.1 #3 selectRecruitProspects: USER_DRIVEN busy peer excluded', () => {
+  reset();
+  addPeer('code-user-peer', 'code', ['code']);
+  setPeerBusy(config, 'code-user-peer', 'USER_DRIVEN');
+  const prospects = selectRecruitProspects(config, {
+    capabilities: ['code'],
+    excludeIds: [],
+  });
+  assert.equal(prospects.length, 0, 'USER_DRIVEN still excludes (regression guard)');
+});
+
 test('expireRecruits: deserializes JSON cap arrays correctly', () => {
   reset();
   addPeer('code-orig', 'code');
