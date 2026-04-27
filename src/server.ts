@@ -118,21 +118,19 @@ function readActiveFile(path: string): { id: string; label: string; sessionId: s
 // After adoption, rewrite the active file to include the MCP server's
 // own pid so liveness probes (process.kill(pid, 0)) work cross-platform.
 // SessionStart only knows the hook's ppid, which on Windows-native is a
-// different process tree from the MCP server. Best-effort — never throws.
+// different process tree from the MCP server. v1.3+: single sessionId-keyed
+// file, no ppid duplicate. Best-effort — never throws.
 function stampMcpPidIntoActiveFile(label: string, sessionId: string | null): void {
-  const candidates: string[] = [];
-  if (sessionId) candidates.push(paths.active(label, sessionId));
-  candidates.push(paths.activeByPpid(label, PPID));
-  for (const path of candidates) {
-    if (!existsSync(path)) continue;
-    let parsed: Record<string, unknown>;
-    try { parsed = JSON.parse(readFileSync(path, 'utf-8')); }
-    catch { continue; }
-    if (parsed.mcpPid === process.pid) continue;
-    parsed.mcpPid = process.pid;
-    try { writeFileSync(path, JSON.stringify(parsed, null, 2), 'utf-8'); }
-    catch { /* best-effort */ }
-  }
+  if (!sessionId) return;
+  const path = paths.active(label, sessionId);
+  if (!existsSync(path)) return;
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(readFileSync(path, 'utf-8')); }
+  catch { return; }
+  if (parsed.mcpPid === process.pid) return;
+  parsed.mcpPid = process.pid;
+  try { writeFileSync(path, JSON.stringify(parsed, null, 2), 'utf-8'); }
+  catch { /* best-effort */ }
 }
 
 interface ActiveFileCandidate {
@@ -167,6 +165,7 @@ function json(data: unknown) { return text(JSON.stringify(data, null, 2)); }
 // ── Auto-mode state file (for PreToolUse hook to read) ─────────────
 
 function writeAutoStateFile(label: string, thread: Thread): void {
+  if (!selfSessionId) return;
   const payload = JSON.stringify({
     threadId: thread.threadId,
     goal: thread.goal,
@@ -174,21 +173,14 @@ function writeAutoStateFile(label: string, thread: Thread): void {
     maxTurns: thread.maxTurns,
     maxWallClockSec: thread.maxWallClockSec,
   }, null, 2);
-  // Write both keyings so PreToolUse hooks find the state regardless of
-  // whether they look up by session_id or ppid.
-  if (selfSessionId) {
-    writeFileSync(paths.autoState(label, selfSessionId), payload, 'utf-8');
-  }
-  writeFileSync(paths.autoStateByPpid(label, PPID), payload, 'utf-8');
+  writeFileSync(paths.autoState(label, selfSessionId), payload, 'utf-8');
 }
 
 function deleteAutoStateFile(label: string): void {
-  const candidates: string[] = [paths.autoStateByPpid(label, PPID)];
-  if (selfSessionId) candidates.push(paths.autoState(label, selfSessionId));
-  for (const path of candidates) {
-    if (existsSync(path)) {
-      try { unlinkSync(path); } catch { /* best-effort */ }
-    }
+  if (!selfSessionId) return;
+  const path = paths.autoState(label, selfSessionId);
+  if (existsSync(path)) {
+    try { unlinkSync(path); } catch { /* best-effort */ }
   }
 }
 
@@ -289,8 +281,9 @@ function requireSelf(): string {
     // Self-bootstrap: no hook has written a session file yet (e.g. /mcp
     // reconnect happened without a fresh SessionStart, or the hook is
     // disabled). Generate our own ID and a synthetic session_id, then
-    // write both session-keyed and ppid-keyed active files so any
-    // subsequent hook on this Claude Code session can find us.
+    // write the session-keyed active file so any subsequent hook on
+    // this Claude Code session can find us. v1.3+: no ppid-keyed
+    // duplicate — sessionId is the only discriminator.
     const label = process.env.SYNAPSE_LABEL;
     if (!label) {
       throw new Error('Not registered. Call synapse_register first or set SYNAPSE_LABEL.');
@@ -310,8 +303,6 @@ function requireSelf(): string {
       source: 'mcp-bootstrap',
     }, null, 2);
     try { writeFileSync(paths.active(label, sessionId), payload, 'utf-8'); }
-    catch { /* best-effort */ }
-    try { writeFileSync(paths.activeByPpid(label, PPID), payload, 'utf-8'); }
     catch { /* best-effort */ }
     selfId = id;
     selfLabel = label;
@@ -382,8 +373,8 @@ const server = new McpServer(
 server.registerTool(
   'synapse_register',
   {
-    title: 'Register Client',
-    description: 'Assign this session an ephemeral peer ID. Call once at session start.',
+    title: 'Register Client (DEPRECATED)',
+    description: 'DEPRECATED — do not call. The SessionStart hook auto-registers each session with the right identity, and the MCP server adopts that identity on first tool call (or self-bootstraps if the hook is unavailable). Calling synapse_register manually creates a peer row with a NEW id but does NOT update the active file or set the MCP\'s sessionId, causing the post-tool-use hook and the MCP to disagree on selfId for the rest of the session. Will be removed in a future release.',
     inputSchema: z.object({
       label: z.string().describe('Human-friendly label (e.g. "code", "desktop", "ipad-code"). A short suffix is appended for uniqueness.'),
       capabilities: z.array(z.string()).optional().describe('Optional capability tags (e.g. "filesystem", "browser", "git").'),
@@ -404,7 +395,12 @@ server.registerTool(
     pruneExpired(config);
     selfId = id;
     selfLabel = label;
-    return json({ id, label, registeredAt: now });
+    return json({
+      id,
+      label,
+      registeredAt: now,
+      warning: 'synapse_register is deprecated; see tool description.',
+    });
   },
 );
 
@@ -985,7 +981,9 @@ server.registerTool(
   async () => {
     // Best-effort adoption so diag isn't the odd one out that always
     // reports `self: null` when it's the first synapse tool called in a
-    // session. Read-only — never bootstrap, never throw.
+    // session. Read-only — never bootstrap, never throw. Also stamps
+    // mcpPid so liveness probes don't false-positive `mcp-pid-dead`
+    // when diag is the FIRST synapse call in a session.
     if (!selfId) {
       try {
         const adopted = tryAdoptFromHook();
@@ -994,6 +992,7 @@ server.registerTool(
           selfLabel = adopted.label;
           selfSessionId = adopted.sessionId;
           touchPeer(config, selfId);
+          stampMcpPidIntoActiveFile(adopted.label, adopted.sessionId);
         }
       } catch { /* diag is read-only; swallow */ }
     }

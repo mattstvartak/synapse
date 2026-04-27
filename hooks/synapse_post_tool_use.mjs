@@ -3,9 +3,10 @@
  * Synapse PostToolUse hook — runs after every tool call resolves.
  *
  * Behavior:
- *  - Cheap unread count for this peer's inbox (direct, broadcast,
- *    thread-where-I-participate). Cap at LIMIT 50 so the query stays O(1)
- *    even on a flooded inbox.
+ *  - Counts the inbox for this session's peer ID via a single SELECT
+ *    COUNT(*) (matches pollInbox semantics — no LIMIT cap, no sender
+ *    liveness filter, just direct + broadcast + thread-where-I-participate
+ *    AND expires_at >= now AND read_at IS NULL).
  *  - If anything is pending, emits `additionalContext` containing a
  *    light marker tag — e.g. `<peer_input_pending count="3" labels="code, desktop"/>`.
  *    The model sees the marker between tool calls and can decide to call
@@ -14,11 +15,17 @@
  *  - Does NOT mark messages as read. Surfacing bodies + auto-acking
  *    remains the responsibility of the UserPromptSubmit hook so that
  *    the user always gets a clean transcript of incoming peer messages.
+ *  - Identity adoption validates against the peer DB: the session_id-keyed
+ *    direct hit only wins if its `parsed.id` is a live peer. Otherwise the
+ *    hook falls through to the freshest-active-file branch. This keeps the
+ *    hook's selfId in sync with the MCP server even after a /mcp reconnect
+ *    bootstrap-as-new-id (see synapse_post_tool_use docstring & matching
+ *    fix in server.ts:readActiveFile).
  *  - Always exits 0; never blocks the tool flow. Failures log to
  *    stderr and emit `{}` (no-op).
  *
  * Stdin payload: { session_id, transcript_path, tool_name, tool_input,
- *                  tool_response } — ignored. The count is tool-agnostic.
+ *                  tool_response } — ignored except session_id.
  *
  * Env:
  *   SYNAPSE_LABEL                 required (otherwise no-op)
@@ -65,13 +72,32 @@ function readStdinJson() {
   } catch { return null; }
 }
 
-function findActiveFile(dataDir, label, sessionId, ppid, maxAgeMs) {
-  // 1. Direct session_id hit (cheapest).
+// Returns true if the active file at `path` references a peer that
+// currently exists in the DB. Defends against the identity-divergence
+// trap: SessionStart writes a file with id=A, then peer A gets cleaned
+// up + MCP reconnects as id=B. The original session_id-keyed file still
+// claims A but is dead state. Without this validation the hook would
+// keep counting messages addressed to A while the MCP polls/acks for B.
+function activeFileHasLivePeer(db, path) {
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(path, 'utf-8')); }
+  catch { return false; }
+  if (!parsed?.id) return false;
+  const row = db.prepare(`SELECT 1 FROM peers WHERE id = ?`).get(parsed.id);
+  return !!row;
+}
+
+function findActiveFile(db, dataDir, label, sessionId, maxAgeMs) {
+  // 1. Direct session_id hit — only trust it if the file points at a
+  //    live peer. Stale session_id files get demoted to a fall-through.
   if (sessionId) {
     const candidate = join(dataDir, `active-${label}-${sessionId}.json`);
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate) && activeFileHasLivePeer(db, candidate)) {
+      return candidate;
+    }
   }
-  // 2. Freshest active-<label>-*.json within heartbeat window.
+  // 2. Freshest active-<label>-*.json within heartbeat window AND
+  //    pointing at a live peer.
   let entries;
   try { entries = readdirSync(dataDir); } catch { entries = []; }
   const prefix = `active-${label}-`;
@@ -83,22 +109,15 @@ function findActiveFile(dataDir, label, sessionId, ppid, maxAgeMs) {
     let stat;
     try { stat = statSync(full); } catch { continue; }
     if (stat.mtimeMs < cutoff) continue;
+    if (!activeFileHasLivePeer(db, full)) continue;
     if (stat.mtimeMs > bestMtime) { bestMtime = stat.mtimeMs; best = full; }
   }
-  if (best) return best;
-  // 3. Legacy ppid-keyed path.
-  const legacyPpid = join(dataDir, `active-${label}-${ppid}.json`);
-  if (existsSync(legacyPpid)) return legacyPpid;
-  // 4. Legacy unscoped path.
-  const legacyUnscoped = join(dataDir, `active-${label}.json`);
-  if (existsSync(legacyUnscoped)) return legacyUnscoped;
-  return null;
+  return best;
 }
 
 const label = parseLabel();
 const dataDir = process.env.SYNAPSE_DATA_DIR ?? join(homedir(), '.claude', 'synapse');
 const peerTimeoutSec = parseInt(process.env.SYNAPSE_PEER_TIMEOUT_SECONDS ?? '600', 10);
-const PPID = process.ppid;
 const stdinPayload = readStdinJson();
 const sessionId = (stdinPayload && typeof stdinPayload.session_id === 'string')
   ? stdinPayload.session_id : null;
@@ -106,25 +125,62 @@ const sessionId = (stdinPayload && typeof stdinPayload.session_id === 'string')
 if (!label) emitNothing();
 
 try {
-  const sessionPath = findActiveFile(dataDir, label, sessionId, PPID, peerTimeoutSec * 1000);
-  if (!sessionPath) emitNothing();
-
-  let parsed;
-  try { parsed = JSON.parse(readFileSync(sessionPath, 'utf-8')); } catch { emitNothing(); }
-  const selfId = parsed?.id;
-  if (!selfId) emitNothing();
-
   const dbPath = join(dataDir, 'synapse.db');
   if (!existsSync(dbPath)) emitNothing();
 
   const db = new DatabaseSync(dbPath);
   db.exec(`PRAGMA journal_mode = WAL`);
 
-  const now = new Date().toISOString();
-  const heartbeatCutoff = new Date(Date.now() - peerTimeoutSec * 1000).toISOString();
+  // findActiveFile needs the DB so it can validate that each candidate
+  // file's `parsed.id` is a live peer (rejecting stale identity files
+  // left over from previous sessions).
+  const sessionPath = findActiveFile(db, dataDir, label, sessionId, peerTimeoutSec * 1000);
+  if (!sessionPath) { db.close(); emitNothing(); }
 
-  const rows = db.prepare(`
-    SELECT m.id, p.label AS fromLabel, m.from_id AS fromId
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(sessionPath, 'utf-8')); } catch { db.close(); emitNothing(); }
+  const selfId = parsed?.id;
+  if (!selfId) { db.close(); emitNothing(); }
+
+  const now = new Date().toISOString();
+
+  // True unread count, not LIMIT-clamped. The previous `LIMIT 50` arm
+  // returned `rows.length` to `count="..."`, which saturates at 50 once
+  // unread genuinely exceeds 50 — making the marker look frozen even as
+  // the user acks messages. Sender-liveness join was also dropped: a
+  // message from a peer who just went silent is still a real message
+  // and shouldn't disappear from the unread count. This now matches
+  // pollInbox semantics exactly.
+  const countRow = db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM messages
+    WHERE (
+      to_id = ?
+      OR (to_id = 'broadcast' AND from_id != ?)
+      OR (
+        to_id LIKE 'thread:%'
+        AND from_id != ?
+        AND EXISTS (
+          SELECT 1 FROM thread_participants tp
+          WHERE tp.thread_id = messages.thread_id AND tp.peer_id = ?
+        )
+      )
+    )
+    AND expires_at >= ?
+    AND read_at IS NULL
+  `).get(selfId, selfId, selfId, selfId, now);
+  const total = Number(countRow?.n ?? 0);
+
+  if (total === 0) {
+    db.close();
+    emitNothing();
+  }
+
+  // Cheap second query for sender labels — only fired when we have
+  // something to surface. Capped at LIMIT 5 since labels are display
+  // hints, not the authoritative count.
+  const labelRows = db.prepare(`
+    SELECT DISTINCT COALESCE(p.label, m.from_id) AS senderLabel
     FROM messages m
     LEFT JOIN peers p ON p.id = m.from_id
     WHERE (
@@ -141,21 +197,18 @@ try {
     )
     AND m.expires_at >= ?
     AND m.read_at IS NULL
-    AND (p.last_seen_at IS NULL OR p.last_seen_at >= ?)
-    LIMIT 50
-  `).all(selfId, selfId, selfId, selfId, now, heartbeatCutoff);
+    LIMIT 5
+  `).all(selfId, selfId, selfId, selfId, now);
 
   db.close();
 
-  if (rows.length === 0) emitNothing();
-
-  const senderLabels = [...new Set(
-    rows.map(r => r.fromLabel ?? r.fromId).filter(Boolean)
-  )].slice(0, 5);
+  const senderLabels = labelRows
+    .map(r => r.senderLabel)
+    .filter(Boolean);
   const labelsAttr = senderLabels.length
     ? ` labels="${senderLabels.join(', ').replace(/"/g, '&quot;')}"`
     : '';
-  const marker = `<peer_input_pending count="${rows.length}"${labelsAttr}/>`;
+  const marker = `<peer_input_pending count="${total}"${labelsAttr}/>`;
 
   emitContext(marker);
 } catch (err) {
