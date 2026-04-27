@@ -108,6 +108,80 @@ export const INIT_SCHEMA_SQL = `
     source     TEXT NOT NULL DEFAULT 'voluntary',
     PRIMARY KEY (thread_id, peer_id)
   );
+
+  -- §4.10 recruitment + auto-join. Recruiter calls synapse_recruit; daemon
+  -- inserts a row here, broadcasts a [RECRUIT] marker message to matching
+  -- prospects, and emits a [RECRUIT_EXPIRED] synthetic inbound message
+  -- back to the originator on TTL expiry. Joiners are tracked via
+  -- thread_participants (auto-joined to the recruit's threadId).
+  --
+  -- description_hash backs the 60s dedup window: recruiter retransmits the
+  -- same description within 60s = suppress at daemon (counter
+  -- recruit.dedupe_blocks).
+  --
+  -- Capabilities + exclude_caps are JSON arrays; require_all flips any-of
+  -- vs all-of matching. Urgency ('low' | 'normal' | 'high') drives expiry
+  -- TTL: low=10min, normal=5min, high=2min.
+  CREATE TABLE IF NOT EXISTS recruits (
+    id               TEXT PRIMARY KEY,
+    originator_id    TEXT NOT NULL,
+    thread_id        TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    capabilities     TEXT,
+    require_all      INTEGER NOT NULL DEFAULT 0,
+    exclude_caps     TEXT,
+    urgency          TEXT NOT NULL,
+    originator_busy  INTEGER NOT NULL DEFAULT 1,
+    workspace        TEXT,
+    created_at       TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    fulfilled_at     TEXT,
+    expired_at       TEXT,
+    description_hash TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_recruits_expires    ON recruits(expires_at) WHERE expired_at IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_recruits_originator ON recruits(originator_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_recruits_dedup      ON recruits(originator_id, description_hash, created_at);
+
+  -- §4.10 busy-state tracking. Idle = no row. Set busy = INSERT/REPLACE.
+  -- Set idle = DELETE row (the IdleReason is recorded in audit_log only,
+  -- not in this table — recruit-prospect sort consults the most recent
+  -- idle audit entry per peer rather than a stored column).
+  --
+  -- Daemon-restart sweep clears all rows on startup so concurrent-binding
+  -- restarts don't leak stale busy state. Stale-busy GC also removes rows
+  -- where busy_at is older than 30min (configurable via
+  -- SYNAPSE_BUSY_STALE_SEC, default 1800).
+  --
+  -- busy_reason is the BusyReason enum (free-form TEXT to keep schema
+  -- forward-compatible with future reason codes); known values today:
+  -- USER_DRIVEN, DRAFTING, EXPLICIT_BUSY, RECRUIT_ENGAGED.
+  CREATE TABLE IF NOT EXISTS peer_busy_state (
+    peer_id           TEXT PRIMARY KEY REFERENCES peers(id) ON DELETE CASCADE,
+    busy_at           TEXT NOT NULL,
+    busy_reason       TEXT NOT NULL,
+    shim_fingerprint  TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_busy_at ON peer_busy_state(busy_at);
+
+  -- §4.10 idle-event log. peer_busy_state row is gone on idle, so we
+  -- can't store IdleReason there. Instead append a row here on each
+  -- busy → idle transition. selectRecruitProspects reads MAX(idle_at)
+  -- per peer to break ties (freshness signal — peer with older
+  -- last_idle_at has been resting longer, more likely to be available).
+  --
+  -- Rotates: rows older than 30min are GC'd by the daemon timer.
+  -- Cap: storage helpers don't enforce a max size; relying on GC.
+  CREATE TABLE IF NOT EXISTS peer_idle_log (
+    peer_id     TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+    idle_at     TEXT NOT NULL,
+    idle_reason TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_idle_log_peer_at ON peer_idle_log(peer_id, idle_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_idle_log_at      ON peer_idle_log(idle_at);
 `;
 
 // Schema migrations for databases initialized against an older

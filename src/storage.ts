@@ -1153,3 +1153,362 @@ export function listAudit(
     LIMIT ?
   `).all(...params, limit) as unknown as AuditEntry[];
 }
+
+// ── §4.10 busy-state ──────────────────────────────────────────────
+// Idle = no row. Set busy = INSERT/REPLACE. Set idle = DELETE.
+// IdleReason is tracked in audit_log only (recruit-prospect sort
+// consults the most recent idle audit entry per peer).
+
+export type BusyReason = 'USER_DRIVEN' | 'DRAFTING' | 'EXPLICIT_BUSY' | 'RECRUIT_ENGAGED' | string;
+
+export interface BusyStateRow {
+  peerId: string;
+  busyAt: string;
+  busyReason: BusyReason;
+  shimFingerprint: string | null;
+}
+
+export function setPeerBusy(
+  config: SynapseConfig,
+  peerId: string,
+  reason: BusyReason,
+  shimFingerprint?: string | null,
+): void {
+  const now = new Date().toISOString();
+  getDb(config).prepare(`
+    INSERT INTO peer_busy_state (peer_id, busy_at, busy_reason, shim_fingerprint)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(peer_id) DO UPDATE SET
+      busy_at          = excluded.busy_at,
+      busy_reason      = excluded.busy_reason,
+      shim_fingerprint = excluded.shim_fingerprint
+  `).run(peerId, now, reason, shimFingerprint ?? null);
+}
+
+export function clearPeerBusy(config: SynapseConfig, peerId: string): void {
+  getDb(config).prepare(`DELETE FROM peer_busy_state WHERE peer_id = ?`).run(peerId);
+}
+
+export function getPeerBusyState(config: SynapseConfig, peerId: string): BusyStateRow | null {
+  const row = getDb(config).prepare(`
+    SELECT peer_id          AS peerId,
+           busy_at           AS busyAt,
+           busy_reason       AS busyReason,
+           shim_fingerprint  AS shimFingerprint
+    FROM peer_busy_state WHERE peer_id = ?
+  `).get(peerId) as BusyStateRow | undefined;
+  return row ?? null;
+}
+
+// Daemon-restart sweep. Concurrent-binding restarts shouldn't leak
+// stale busy state — agreed contract per §4.10 spec.
+export function clearAllPeerBusyState(config: SynapseConfig): number {
+  const result = getDb(config).prepare(`DELETE FROM peer_busy_state`).run();
+  return Number(result.changes ?? 0);
+}
+
+// Stale-busy GC. Default cutoff 30min; override via SYNAPSE_BUSY_STALE_SEC.
+// Returns count cleared so caller can bump a counter.
+export function pruneStaleBusyState(config: SynapseConfig, staleSec?: number): number {
+  const sec = staleSec ?? Number(process.env.SYNAPSE_BUSY_STALE_SEC ?? 1800);
+  const cutoff = new Date(Date.now() - sec * 1000).toISOString();
+  const result = getDb(config).prepare(`
+    DELETE FROM peer_busy_state WHERE busy_at < ?
+  `).run(cutoff);
+  return Number(result.changes ?? 0);
+}
+
+// ── §4.10 idle-event log (freshness signal for recruit sort) ──────
+
+export type IdleReason = 'USER_DONE' | 'EXPLICIT_IDLE' | 'NEVER_BUSY' | 'CRON_ONLY' | 'EXPLICIT_AWAY' | string;
+
+// Append an idle-event row. Called on busy → idle transitions so
+// recruit-prospect sort can prefer freshly-idle peers. EXPLICIT_AWAY
+// is treated as a soft "deprioritize me" signal: peers with this most
+// recent reason are excluded from recruits unless urgency=high.
+export function appendPeerIdleEvent(
+  config: SynapseConfig,
+  peerId: string,
+  reason: IdleReason,
+): void {
+  const now = new Date().toISOString();
+  getDb(config).prepare(`
+    INSERT INTO peer_idle_log (peer_id, idle_at, idle_reason) VALUES (?, ?, ?)
+  `).run(peerId, now, reason);
+}
+
+// Latest idle event per peer (peerId → { idleAt, idleReason }).
+// Used by selectRecruitProspects for sort order + EXPLICIT_AWAY filter.
+export interface PeerIdleEvent {
+  peerId: string;
+  idleAt: string;
+  idleReason: IdleReason;
+}
+
+export function getLatestPeerIdleEvents(
+  config: SynapseConfig,
+  peerIds: string[],
+): Map<string, PeerIdleEvent> {
+  if (peerIds.length === 0) return new Map();
+  const placeholders = peerIds.map(() => '?').join(',');
+  const rows = getDb(config).prepare(`
+    SELECT peer_id AS peerId, idle_at AS idleAt, idle_reason AS idleReason
+    FROM peer_idle_log
+    WHERE peer_id IN (${placeholders})
+    AND (peer_id, idle_at) IN (
+      SELECT peer_id, MAX(idle_at) FROM peer_idle_log
+      WHERE peer_id IN (${placeholders})
+      GROUP BY peer_id
+    )
+  `).all(...peerIds, ...peerIds) as unknown as PeerIdleEvent[];
+
+  const m = new Map<string, PeerIdleEvent>();
+  for (const r of rows) m.set(r.peerId, r);
+  return m;
+}
+
+// GC. Default cutoff 30min; override via SYNAPSE_IDLE_LOG_RETAIN_SEC.
+export function pruneStaleIdleLog(config: SynapseConfig, retainSec?: number): number {
+  const sec = retainSec ?? Number(process.env.SYNAPSE_IDLE_LOG_RETAIN_SEC ?? 1800);
+  const cutoff = new Date(Date.now() - sec * 1000).toISOString();
+  const result = getDb(config).prepare(`
+    DELETE FROM peer_idle_log WHERE idle_at < ?
+  `).run(cutoff);
+  return Number(result.changes ?? 0);
+}
+
+// ── §4.10 recruitment ─────────────────────────────────────────────
+
+export type RecruitUrgency = 'low' | 'normal' | 'high';
+
+export interface RecruitRow {
+  id: string;
+  originatorId: string;
+  threadId: string;
+  description: string;
+  capabilities: string[] | null;
+  requireAll: boolean;
+  excludeCaps: string[] | null;
+  urgency: RecruitUrgency;
+  originatorBusy: boolean;
+  workspace: string | null;
+  createdAt: string;
+  expiresAt: string;
+  fulfilledAt: string | null;
+  expiredAt: string | null;
+  descriptionHash: string;
+}
+
+export function insertRecruit(config: SynapseConfig, recruit: RecruitRow): void {
+  getDb(config).prepare(`
+    INSERT INTO recruits (
+      id, originator_id, thread_id, description, capabilities, require_all,
+      exclude_caps, urgency, originator_busy, workspace, created_at, expires_at,
+      fulfilled_at, expired_at, description_hash
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    recruit.id,
+    recruit.originatorId,
+    recruit.threadId,
+    recruit.description,
+    recruit.capabilities ? JSON.stringify(recruit.capabilities) : null,
+    recruit.requireAll ? 1 : 0,
+    recruit.excludeCaps ? JSON.stringify(recruit.excludeCaps) : null,
+    recruit.urgency,
+    recruit.originatorBusy ? 1 : 0,
+    recruit.workspace,
+    recruit.createdAt,
+    recruit.expiresAt,
+    recruit.fulfilledAt,
+    recruit.expiredAt,
+    recruit.descriptionHash,
+  );
+}
+
+// Dedup: same originator + same description hash within 60s = retransmit.
+// Returns the existing recruit id if found; null otherwise.
+export function findRecentRecruit(
+  config: SynapseConfig,
+  originatorId: string,
+  descriptionHash: string,
+  withinSec: number = 60,
+): string | null {
+  const cutoff = new Date(Date.now() - withinSec * 1000).toISOString();
+  const row = getDb(config).prepare(`
+    SELECT id FROM recruits
+    WHERE originator_id = ? AND description_hash = ? AND created_at >= ?
+    ORDER BY created_at DESC LIMIT 1
+  `).get(originatorId, descriptionHash, cutoff) as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
+// Rate limit: 5/min per peer. Returns count of recruits originated by
+// peerId in the last `withinSec` seconds (default 60).
+export function countRecentRecruits(
+  config: SynapseConfig,
+  originatorId: string,
+  withinSec: number = 60,
+): number {
+  const cutoff = new Date(Date.now() - withinSec * 1000).toISOString();
+  const row = getDb(config).prepare(`
+    SELECT COUNT(*) AS n FROM recruits
+    WHERE originator_id = ? AND created_at >= ?
+  `).get(originatorId, cutoff) as { n: number };
+  return Number(row.n);
+}
+
+// Expire recruits past TTL with no fulfilled_at. Returns the expired
+// rows so the caller can emit [RECRUIT_EXPIRED] synthetic messages
+// back to originators.
+export function expireRecruits(config: SynapseConfig): RecruitRow[] {
+  const now = new Date().toISOString();
+  const expired = getDb(config).prepare(`
+    SELECT id, originator_id AS originatorId, thread_id AS threadId, description,
+           capabilities, require_all AS requireAll, exclude_caps AS excludeCaps,
+           urgency, originator_busy AS originatorBusy, workspace,
+           created_at AS createdAt, expires_at AS expiresAt,
+           fulfilled_at AS fulfilledAt, expired_at AS expiredAt,
+           description_hash AS descriptionHash
+    FROM recruits
+    WHERE expires_at < ? AND expired_at IS NULL
+  `).all(now) as Array<Omit<RecruitRow, 'capabilities' | 'excludeCaps' | 'requireAll' | 'originatorBusy'> & {
+    capabilities: string | null;
+    excludeCaps: string | null;
+    requireAll: number;
+    originatorBusy: number;
+  }>;
+
+  if (expired.length === 0) return [];
+
+  const ids = expired.map(r => r.id);
+  getDb(config).prepare(`
+    UPDATE recruits SET expired_at = ? WHERE id IN (${ids.map(() => '?').join(',')})
+  `).run(now, ...ids);
+
+  return expired.map(r => ({
+    ...r,
+    capabilities: r.capabilities ? JSON.parse(r.capabilities) as string[] : null,
+    excludeCaps: r.excludeCaps ? JSON.parse(r.excludeCaps) as string[] : null,
+    requireAll: r.requireAll === 1,
+    originatorBusy: r.originatorBusy === 1,
+  }));
+}
+
+// Mark a recruit as fulfilled (first prospect joined). No-op if already set.
+export function fulfillRecruit(config: SynapseConfig, recruitId: string): void {
+  const now = new Date().toISOString();
+  getDb(config).prepare(`
+    UPDATE recruits SET fulfilled_at = ?
+    WHERE id = ? AND fulfilled_at IS NULL
+  `).run(now, recruitId);
+}
+
+// Select prospects matching the recruit's capability filter. Excludes
+// the originator and any peers currently in peer_busy_state. Caps are
+// matched any-of by default; requireAll flips to all-of. excludeCaps
+// removes peers having ANY listed cap. workspace defaults to current
+// workspace; pass workspaces=['*'] to allow cross-workspace.
+export interface RecruitProspectCriteria {
+  capabilities?: string[];
+  requireAll?: boolean;
+  excludeCaps?: string[];
+  excludeIds: string[];
+  workspace?: string | null;
+  // Heartbeat freshness: peer must have been seen within this window
+  // (seconds). Default 600 = 10min, matches existing peer-staleness cutoff.
+  freshnessSec?: number;
+  // §4.10 urgency-aware EXPLICIT_AWAY filter. By default EXPLICIT_AWAY
+  // peers are excluded ("deprioritize me"); pass urgency='high' to
+  // include them ("emergency, recruit anyone available").
+  urgency?: RecruitUrgency;
+}
+
+// IdleReason → sort weight (lower = preferred). Recruit-prospect sort
+// consults the most-recent peer_idle_log entry per peer; ties resolve
+// by older idleAt (peer has been resting longer).
+const IDLE_REASON_WEIGHT: Record<string, number> = {
+  USER_DONE: 0,
+  NEVER_BUSY: 1,
+  CRON_ONLY: 2,
+  EXPLICIT_IDLE: 3,
+  EXPLICIT_AWAY: 4,
+};
+
+export function selectRecruitProspects(
+  config: SynapseConfig,
+  criteria: RecruitProspectCriteria,
+): Peer[] {
+  const freshnessSec = criteria.freshnessSec ?? 600;
+  const cutoff = new Date(Date.now() - freshnessSec * 1000).toISOString();
+  const excludeList = criteria.excludeIds.length > 0
+    ? `AND p.id NOT IN (${criteria.excludeIds.map(() => '?').join(',')})`
+    : '';
+
+  // Base query: heartbeat-fresh peers, not in busy table, not excluded.
+  const rows = getDb(config).prepare(`
+    SELECT p.id            AS id,
+           p.label          AS label,
+           p.registered_at  AS registeredAt,
+           p.last_seen_at   AS lastSeenAt,
+           p.capabilities   AS capabilities
+    FROM peers p
+    LEFT JOIN peer_busy_state pbs ON pbs.peer_id = p.id
+    WHERE p.last_seen_at >= ?
+      AND pbs.peer_id IS NULL
+      ${excludeList}
+  `).all(cutoff, ...criteria.excludeIds) as unknown as Peer[];
+
+  // In-memory cap filter — capabilities are JSON in the column, awkward
+  // to filter via SQL. List sizes are small (handful of peers), perf is fine.
+  const requireAll = criteria.requireAll === true;
+  const requestedCaps = criteria.capabilities ?? [];
+  const excludeCaps = criteria.excludeCaps ?? [];
+
+  const capFiltered = rows.filter((p: Peer) => {
+    let peerCaps: string[] = [];
+    if (typeof p.capabilities === 'string' && p.capabilities) {
+      try { peerCaps = JSON.parse(p.capabilities) as string[]; } catch { peerCaps = []; }
+    } else if (Array.isArray(p.capabilities)) {
+      peerCaps = p.capabilities as string[];
+    }
+
+    if (excludeCaps.length > 0) {
+      const hasExcluded = excludeCaps.some(ec => peerCaps.includes(ec));
+      if (hasExcluded) return false;
+    }
+
+    if (requestedCaps.length === 0) return true; // no cap filter = all idle peers
+
+    if (requireAll) {
+      return requestedCaps.every(c => peerCaps.includes(c));
+    }
+    return requestedCaps.some(c => peerCaps.includes(c));
+  });
+
+  if (capFiltered.length === 0) return [];
+
+  // Layer in idle-log freshness data + EXPLICIT_AWAY filter.
+  const idleEvents = getLatestPeerIdleEvents(config, capFiltered.map(p => p.id));
+  const isHighUrgency = criteria.urgency === 'high';
+
+  const awayFiltered = capFiltered.filter(p => {
+    const evt = idleEvents.get(p.id);
+    if (!evt) return true; // no idle event yet = NEVER_BUSY default, always recruitable
+    if (evt.idleReason === 'EXPLICIT_AWAY' && !isHighUrgency) return false;
+    return true;
+  });
+
+  // Sort by IdleReason precedence (USER_DONE > NEVER_BUSY > CRON_ONLY >
+  // EXPLICIT_IDLE > EXPLICIT_AWAY), tiebreak by older idleAt (rested longer).
+  return awayFiltered.sort((a, b) => {
+    const ea = idleEvents.get(a.id);
+    const eb = idleEvents.get(b.id);
+    const wa = ea ? (IDLE_REASON_WEIGHT[ea.idleReason] ?? 99) : IDLE_REASON_WEIGHT.NEVER_BUSY;
+    const wb = eb ? (IDLE_REASON_WEIGHT[eb.idleReason] ?? 99) : IDLE_REASON_WEIGHT.NEVER_BUSY;
+    if (wa !== wb) return wa - wb;
+    // Tiebreak: older idleAt sorts FIRST (resting longer = more available)
+    const ta = ea ? new Date(ea.idleAt).getTime() : 0;
+    const tb = eb ? new Date(eb.idleAt).getTime() : 0;
+    return ta - tb;
+  });
+}
