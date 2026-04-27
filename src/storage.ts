@@ -501,6 +501,52 @@ export function listMyThreads(
   return (rows as Array<{ threadId: string }>).map(r => r.threadId);
 }
 
+// §1.6 sub-bug — peer-id alias table. When a shim's peer-id rotates
+// (token resolved to A pre-restart, B post-restart, or hook-minted A
+// vs daemon-minted B), we record the old → new mapping here so messages
+// addressed to the stale id can be transparently auto-redirected to
+// the current one in synapse_send/reply. Closes the "ghost-peer
+// attribution" gap.
+
+export function writePeerAlias(
+  config: SynapseConfig,
+  aliasId: string,
+  currentPeerId: string,
+): void {
+  if (aliasId === currentPeerId) return; // self-pointing alias is meaningless
+  const now = new Date().toISOString();
+  // If the alias already points somewhere else, update to the new
+  // current_peer_id (rotation chain collapses to latest).
+  getDb(config).prepare(`
+    INSERT INTO peer_aliases (alias_id, current_peer_id, rotated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(alias_id) DO UPDATE SET
+      current_peer_id = excluded.current_peer_id,
+      rotated_at      = excluded.rotated_at
+  `).run(aliasId, currentPeerId, now);
+  // If currentPeerId itself is in the alias table (i.e. someone earlier
+  // rotated to currentPeerId, but it has since rotated again), follow
+  // the chain by updating the OLD alias too. Single SQL pass.
+  getDb(config).prepare(`
+    UPDATE peer_aliases SET current_peer_id = ?, rotated_at = ?
+    WHERE current_peer_id = ?
+  `).run(currentPeerId, now, aliasId);
+}
+
+// Resolve a peer-id to its CURRENT id following any aliases. Returns
+// the input unchanged if no alias exists. Single lookup; aliases are
+// stored already-collapsed (writePeerAlias updates the chain) so we
+// don't recurse here.
+export function resolvePeerAlias(
+  config: SynapseConfig,
+  peerId: string,
+): string {
+  const row = getDb(config).prepare(
+    `SELECT current_peer_id AS currentId FROM peer_aliases WHERE alias_id = ?`,
+  ).get(peerId) as { currentId: string } | undefined;
+  return row?.currentId ?? peerId;
+}
+
 // §4.7 capability advertising — peer announces what kinds of work it
 // can route. Stored as a JSON array on peers.capabilities. Senders use
 // it to disambiguate when multiple peers share a label, and §4.8/§5.5

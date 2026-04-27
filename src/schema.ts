@@ -85,6 +85,21 @@ export const INIT_SCHEMA_SQL = `
   -- synapse_thread / synapse_thread_state / synapse_thread_participants —
   -- with short TTL). Consumers see source in the wait_reply payload and
   -- can weight trust. Voluntary overrides implicit on conflict.
+  -- §1.6 sub-bug fix (ghost-peer attribution / outbound-to-stale-id).
+  -- When a shim's peer-id rotates (e.g. SessionStart hook minted A but
+  -- daemon resolved to B for the same identity-token), we record A → B
+  -- here. Outbound to A then auto-redirects to B with an audit entry.
+  -- alias_id is the OLD peer-id; current_peer_id is the active one.
+  -- One row per stale id; if a peer rotates again (B → C), we update
+  -- alias_id=A's row to current=C and add a new row alias_id=B → C.
+  CREATE TABLE IF NOT EXISTS peer_aliases (
+    alias_id        TEXT PRIMARY KEY,
+    current_peer_id TEXT NOT NULL,
+    rotated_at      TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_peer_aliases_current ON peer_aliases(current_peer_id);
+
   CREATE TABLE IF NOT EXISTS drafting_state (
     thread_id  TEXT NOT NULL,
     peer_id    TEXT NOT NULL,

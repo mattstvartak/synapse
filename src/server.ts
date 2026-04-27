@@ -17,6 +17,7 @@ import {
   listVisibleThreads,
   setDrafting, clearDrafting, markImplicitDrafting, getOtherPeersDrafting,
   setPeerCapabilities,
+  resolvePeerAlias,
   listActiveFiles, classifyActiveFile, deleteActiveFile,
   findActiveFileDuplicates,
   dropPeersExcept,
@@ -500,6 +501,22 @@ server.registerTool(
     const from = requireSelf();
     touchPeer(config, from);
 
+    // §1.6 sub-bug fix — auto-redirect a stale peer-id `to` to its
+    // current value via peer_aliases. Only applies to direct peer
+    // addressing (broadcast / thread:<id> bypass aliasing). The
+    // original `to` is still recorded in the audit log so debugging
+    // can trace the redirect; the message itself lands on the
+    // resolved current id so the active peer receives it.
+    let resolvedTo = to;
+    if (to !== 'broadcast' && !isThreadAddress(to)) {
+      const current = resolvePeerAlias(config, to);
+      if (current !== to) {
+        bumpCounter('send.alias_redirects');
+        recordAudit('synapse_send', from, threadId ?? null, { to_alias: to, to_resolved: current }, 'allowed', 'peer_alias_redirect');
+        resolvedTo = current;
+      }
+    }
+
     // §5.6(b) strict_inbox — check BEFORE insertMessage so a refused
     // send doesn't pollute the audit log with a "sent then warned"
     // trace. Auto-ack first (§5.6(d)) so the strict check counts only
@@ -525,12 +542,14 @@ server.registerTool(
     // always an accidental fragmentation (lived through it during
     // the proposal-doc session). Caller can opt out by passing the
     // shared threadId explicitly, or use synapse_reply.
-    if (!threadId && to !== 'broadcast' && !isThreadAddress(to)) {
-      const sharedThread = findRecentSharedThread(config, from, to);
+    // Uses resolvedTo so a stale-id alias still benefits from the
+    // fragmentation guard against the canonical peer's threads.
+    if (!threadId && resolvedTo !== 'broadcast' && !isThreadAddress(resolvedTo)) {
+      const sharedThread = findRecentSharedThread(config, from, resolvedTo);
       if (sharedThread) {
         bumpCounter('send.fragmentation_blocks');
         throw new Error(
-          `Refusing to mint a new thread: an active thread (${sharedThread}) already exists between ${from} and ${to}. ` +
+          `Refusing to mint a new thread: an active thread (${sharedThread}) already exists between ${from} and ${resolvedTo}. ` +
           `Use synapse_reply({ messageId }) to continue the conversation, or pass threadId="${sharedThread}" explicitly to synapse_send. ` +
           `Pass threadId=<new uuid> to deliberately start a separate thread.`,
         );
@@ -541,19 +560,20 @@ server.registerTool(
     // explicit threadId was provided, the addressed thread IS the thread.
     // Without this, the message lands on a fresh random threadId that
     // nobody is a participant of, so participation-filtered inbox queries
-    // miss it. Explicit threadId still wins when provided.
+    // miss it. Explicit threadId still wins when provided. Uses resolvedTo
+    // so an alias-bearing address still routes the thread:<id> form.
     let tid: string;
     if (threadId) {
       tid = threadId;
-    } else if (isThreadAddress(to)) {
-      tid = threadIdFromAddress(to)!;
+    } else if (isThreadAddress(resolvedTo)) {
+      tid = threadIdFromAddress(resolvedTo)!;
     } else {
       tid = randomUUID();
     }
 
     const cap = checkAndCountAuto(tid, from, body);
     if (!cap.allowed) {
-      recordAudit('synapse_send', from, tid, { to, threadId: tid }, 'blocked', cap.reason);
+      recordAudit('synapse_send', from, tid, { to: resolvedTo, threadId: tid }, 'blocked', cap.reason);
       throw new Error(cap.reason ?? 'Auto-mode cap exceeded');
     }
 
@@ -564,7 +584,7 @@ server.registerTool(
     const msg: Message = {
       id,
       fromId: from,
-      toId: to,
+      toId: resolvedTo,
       threadId: tid,
       parentId: null,
       body,
@@ -577,7 +597,7 @@ server.registerTool(
 
     // Auto-join sender as participant when addressing a thread (so they see
     // replies). For peer-direct or broadcast addresses, no roster change.
-    const targetThread = isThreadAddress(to) ? threadIdFromAddress(to) : null;
+    const targetThread = isThreadAddress(resolvedTo) ? threadIdFromAddress(resolvedTo) : null;
     if (targetThread) joinThread(config, targetThread, from);
     // Always record the sender as a participant of the thread they sent on,
     // even if `to` is a direct peer ID — keeps thread_state consistent.
@@ -592,7 +612,7 @@ server.registerTool(
     // so the pendingInbound alert below isn't a false positive.
     ackRecentlySeen();
 
-    recordAudit('synapse_send', from, tid, { to, messageId: id }, 'allowed');
+    recordAudit('synapse_send', from, tid, { to: resolvedTo, messageId: id }, 'allowed');
     return json({
       messageId: id,
       threadId: tid,
