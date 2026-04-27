@@ -149,6 +149,15 @@ export interface PollOptions {
   since?: string;
   unreadOnly?: boolean;
   workspace?: string;
+  // v7.1 #1 — auto-mark returned messages read in the same call. Default
+  // true: a peer that calls synapse_poll has, by definition, seen those
+  // messages, so the read_at flip belongs here rather than in a separate
+  // ack pass. Pass false for "preview without ack" use cases (debugging,
+  // synapse_audit-style introspection). Without this, hooks reading DB
+  // state directly (PreToolUse / PostToolUse markers) keep counting
+  // already-seen messages until the next synapse_send/reply, which
+  // produces the count saturation bug.
+  markRead?: boolean;
 }
 
 export function pollInbox(
@@ -157,7 +166,7 @@ export function pollInbox(
   opts: PollOptions = {},
 ): Message[] {
   pruneExpired(config);
-  const { since, unreadOnly = true, workspace } = opts;
+  const { since, unreadOnly = true, workspace, markRead = true } = opts;
 
   // Inbox visibility:
   //   1. Direct: to_id = self
@@ -196,7 +205,7 @@ export function pollInbox(
     params.push(workspace);
   }
 
-  return getDb(config).prepare(`
+  const messages = getDb(config).prepare(`
     SELECT id,
            from_id    AS fromId,
            to_id      AS toId,
@@ -210,6 +219,29 @@ export function pollInbox(
     WHERE ${where.join(' AND ')}
     ORDER BY created_at ASC
   `).all(...params) as unknown as Message[];
+
+  // v7.1 #1 — flip read_at on the rows we just returned. Only for rows
+  // currently NULL so we don't churn already-acked timestamps when
+  // unreadOnly=false is used to re-fetch within TTL. Single statement
+  // with parameterized id list; row count is bounded by inbox size so
+  // the IN-list stays small.
+  if (markRead && messages.length > 0) {
+    const unreadIds = messages.filter(m => m.readAt == null).map(m => m.id);
+    if (unreadIds.length > 0) {
+      const placeholders = unreadIds.map(() => '?').join(',');
+      const now = new Date().toISOString();
+      getDb(config).prepare(
+        `UPDATE messages SET read_at = ? WHERE id IN (${placeholders}) AND read_at IS NULL`,
+      ).run(now, ...unreadIds);
+      // Reflect the flip on the in-flight return objects so the caller
+      // sees the same state as the DB.
+      for (const m of messages) {
+        if (unreadIds.includes(m.id)) m.readAt = now;
+      }
+    }
+  }
+
+  return messages;
 }
 
 export interface InboxHead {
@@ -1403,6 +1435,71 @@ export function fulfillRecruit(config: SynapseConfig, recruitId: string): void {
   `).run(now, recruitId);
 }
 
+// v7.1 #2 — find the most recent open recruit on a thread that the
+// joining peer's caps satisfy, mark it fulfilled, return its id (or
+// null if no match). Called from synapse_join_thread after the peer
+// is added to the roster, so explicit joins close out their
+// originating recruit just like hook-side auto-joins do. Older
+// matching recruits stay open and expire normally — their originators
+// may have given up and re-recruited, so we only close the freshest.
+//
+// Caps semantics mirror the post-tool-use hook auto-join:
+//   - requireAll=true: peer must have every recruit cap
+//   - requireAll=false: peer must have at least one
+//   - excludeCaps: any match disqualifies
+//   - empty caps list: any peer matches
+export function fulfillMatchingRecruit(
+  config: SynapseConfig,
+  threadId: string,
+  peerId: string,
+): string | null {
+  const candidates = getDb(config).prepare(`
+    SELECT id, capabilities, require_all AS requireAll, exclude_caps AS excludeCaps
+    FROM recruits
+    WHERE thread_id = ?
+      AND fulfilled_at IS NULL
+      AND expired_at IS NULL
+    ORDER BY created_at DESC
+  `).all(threadId) as Array<{
+    id: string;
+    capabilities: string | null;
+    requireAll: number;
+    excludeCaps: string | null;
+  }>;
+  if (candidates.length === 0) return null;
+
+  const peer = getPeer(config, peerId);
+  let peerCaps: string[] = [];
+  if (peer) {
+    if (typeof peer.capabilities === 'string' && peer.capabilities) {
+      try { peerCaps = JSON.parse(peer.capabilities) as string[]; } catch { peerCaps = []; }
+    } else if (Array.isArray(peer.capabilities)) {
+      peerCaps = peer.capabilities as string[];
+    }
+  }
+
+  for (const r of candidates) {
+    let recruitCaps: string[] = [];
+    if (r.capabilities) {
+      try { recruitCaps = JSON.parse(r.capabilities) as string[]; } catch { recruitCaps = []; }
+    }
+    let excludeCaps: string[] = [];
+    if (r.excludeCaps) {
+      try { excludeCaps = JSON.parse(r.excludeCaps) as string[]; } catch { excludeCaps = []; }
+    }
+    if (excludeCaps.some(c => peerCaps.includes(c))) continue;
+    let match = false;
+    if (recruitCaps.length === 0) match = true;
+    else if (r.requireAll === 1) match = recruitCaps.every(c => peerCaps.includes(c));
+    else match = recruitCaps.some(c => peerCaps.includes(c));
+    if (match) {
+      fulfillRecruit(config, r.id);
+      return r.id;
+    }
+  }
+  return null;
+}
+
 // Select prospects matching the recruit's capability filter. Excludes
 // the originator and any peers currently in peer_busy_state. Caps are
 // matched any-of by default; requireAll flips to all-of. excludeCaps
@@ -1444,7 +1541,10 @@ export function selectRecruitProspects(
     ? `AND p.id NOT IN (${criteria.excludeIds.map(() => '?').join(',')})`
     : '';
 
-  // Base query: heartbeat-fresh peers, not in busy table, not excluded.
+  // Base query: heartbeat-fresh peers, either fully idle (no busy row)
+  // or busy with reason='CRON_ONLY' (v7.1 #3 — recurring poll loops
+  // shouldn't mask a peer as permanently busy; treat them as ranked-
+  // idle so auto-join still considers them).
   const rows = getDb(config).prepare(`
     SELECT p.id            AS id,
            p.label          AS label,
@@ -1454,7 +1554,7 @@ export function selectRecruitProspects(
     FROM peers p
     LEFT JOIN peer_busy_state pbs ON pbs.peer_id = p.id
     WHERE p.last_seen_at >= ?
-      AND pbs.peer_id IS NULL
+      AND (pbs.peer_id IS NULL OR pbs.busy_reason = 'CRON_ONLY')
       ${excludeList}
   `).all(cutoff, ...criteria.excludeIds) as unknown as Peer[];
 

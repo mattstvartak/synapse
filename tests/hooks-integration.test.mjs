@@ -116,6 +116,115 @@ test('user_prompt hook: writes peer_busy_state with USER_DRIVEN', () => {
   assert.equal(state.busyReason, 'USER_DRIVEN');
 });
 
+// v7.1 #3 — cron-fired prompts get busy_reason=CRON_ONLY so recruit-
+// prospect selection doesn't treat looped poll jobs as permanent busy.
+test('v7.1 #3: cron-pattern prompt → busy_reason=CRON_ONLY', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a02',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a02', label: 'code', sessionId: 'sess-a02',
+  });
+  const r = runHook('synapse_user_prompt.mjs', {
+    config, label: 'code',
+    stdin: {
+      session_id: 'sess-a02',
+      prompt: 'poll synapse for new messages. Accept work when needed',
+    },
+  });
+  assert.equal(r.status, 0, `hook exit: stderr=${r.stderr}`);
+  const state = getPeerBusyState(config, 'code-a02');
+  assert.ok(state, 'peer_busy_state row exists');
+  assert.equal(state.busyReason, 'CRON_ONLY', 'cron-pattern prompt classified CRON_ONLY');
+});
+
+test('v7.1 #3: explicit source=cron stdin field → busy_reason=CRON_ONLY', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a03',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a03', label: 'code', sessionId: 'sess-a03',
+  });
+  const r = runHook('synapse_user_prompt.mjs', {
+    config, label: 'code',
+    stdin: {
+      session_id: 'sess-a03',
+      prompt: 'arbitrary text the source field overrides',
+      source: 'cron',
+    },
+  });
+  assert.equal(r.status, 0, `hook exit: stderr=${r.stderr}`);
+  const state = getPeerBusyState(config, 'code-a03');
+  assert.equal(state?.busyReason, 'CRON_ONLY');
+});
+
+test('v7.1 #3: real user prompt stays USER_DRIVEN (no cron false-positive)', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a04',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a04', label: 'code', sessionId: 'sess-a04',
+  });
+  const r = runHook('synapse_user_prompt.mjs', {
+    config, label: 'code',
+    stdin: {
+      session_id: 'sess-a04',
+      prompt: 'fix the failing test in storage.ts',
+    },
+  });
+  assert.equal(r.status, 0);
+  const state = getPeerBusyState(config, 'code-a04');
+  assert.equal(state?.busyReason, 'USER_DRIVEN');
+});
+
+test('v7.1 #3: SYNAPSE_CRON_PROMPT_PATTERNS env override matches custom regex', () => {
+  reset();
+  upsertPeer(config, {
+    id: 'code-a05',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  writeSelfActiveFile(config, {
+    selfId: 'code-a05', label: 'code', sessionId: 'sess-a05',
+  });
+  // Run hook with SYNAPSE_CRON_PROMPT_PATTERNS env override.
+  const result = spawnSync('node', [join(HOOKS_DIR, 'synapse_user_prompt.mjs')], {
+    input: JSON.stringify({
+      session_id: 'sess-a05',
+      prompt: 'CUSTOM_CRON_TICK',
+    }),
+    env: {
+      ...process.env,
+      SYNAPSE_LABEL: 'code',
+      SYNAPSE_DATA_DIR: config.dataDir,
+      SYNAPSE_PEER_TIMEOUT_SECONDS: '600',
+      SYNAPSE_CRON_PROMPT_PATTERNS: '^CUSTOM_CRON_TICK$',
+    },
+    encoding: 'utf-8',
+    timeout: 5_000,
+  });
+  assert.equal(result.status, 0, `hook stderr: ${result.stderr}`);
+  const state = getPeerBusyState(config, 'code-a05');
+  assert.equal(state?.busyReason, 'CRON_ONLY');
+});
+
 test('stop hook: clears peer_busy_state + appends peer_idle_log USER_DONE', () => {
   reset();
   getDb(config);
@@ -221,6 +330,82 @@ test('post_tool_use: idle + caps match → auto-joins recruit + replies', () => 
 
   // Hook output should mention auto-join.
   assert.match(r.stdout, /auto-joined/);
+});
+
+// v7.1 #2 — auto-join in the hook should also fulfill the recruit row
+// so the daemon GC sweep doesn't emit a stale [RECRUIT_EXPIRED] notice
+// to the originator after it's been answered.
+test('v7.1 #2: post_tool_use auto-join fulfills the recruit row', () => {
+  reset();
+  const db = getDb(config);
+  upsertPeer(config, {
+    id: 'code-c2-recruiter',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: JSON.stringify(['code', 'bash']),
+  });
+  upsertPeer(config, {
+    id: 'code-c2-self',
+    label: 'code',
+    registeredAt: nowIso(),
+    lastSeenAt: nowIso(),
+    capabilities: null,
+  });
+  setPeerCapabilities(config, 'code-c2-self', ['code']);
+  writeSelfActiveFile(config, {
+    selfId: 'code-c2-self', label: 'code', sessionId: 'sess-c2-01',
+  });
+
+  const recruitId = '55555555-5555-5555-5555-555555555555';
+  const targetThread = 'thread-c2-recruit';
+  const recruitMsgId = 'msg-c2-recruit';
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
+
+  // Seed both the recruits-row AND the [RECRUIT] marker message.
+  db.prepare(`
+    INSERT INTO recruits (
+      id, originator_id, thread_id, description, capabilities, require_all,
+      exclude_caps, urgency, originator_busy, workspace, created_at, expires_at,
+      fulfilled_at, expired_at, description_hash
+    ) VALUES (?, ?, ?, ?, ?, 0, NULL, 'normal', 1, NULL, ?, ?, NULL, NULL, ?)
+  `).run(
+    recruitId, 'code-c2-recruiter', targetThread, 'Need code help',
+    JSON.stringify(['code']), now, expiresAt, 'hash-c2-01',
+  );
+
+  joinThread(config, targetThread, 'code-c2-recruiter');
+  insertMessage(config, {
+    id: recruitMsgId,
+    fromId: 'code-c2-recruiter',
+    toId: 'broadcast',
+    threadId: targetThread,
+    parentId: null,
+    body: `[RECRUIT] id=${recruitId} from=code-c2-recruiter urgency=normal caps=code requireAll=false threadId=${targetThread} originatorBusy=true\n\nNeed code help.`,
+    workspace: null,
+    createdAt: now,
+    expiresAt,
+    readAt: null,
+  });
+
+  const r = runHook('synapse_post_tool_use.mjs', {
+    config, label: 'code',
+    stdin: { session_id: 'sess-c2-01', tool_name: 'Read' },
+  });
+  assert.equal(r.status, 0, `hook exit: stderr=${r.stderr}`);
+
+  // Auto-join happened (smoke check via existing assertion shape).
+  const participantRow = db.prepare(
+    `SELECT 1 AS x FROM thread_participants WHERE thread_id = ? AND peer_id = ?`,
+  ).get(targetThread, 'code-c2-self');
+  assert.ok(participantRow, 'auto-join precondition failed');
+
+  // The new bit — recruit row carries fulfilled_at.
+  const recruitRow = db.prepare(
+    `SELECT fulfilled_at FROM recruits WHERE id = ?`,
+  ).get(recruitId);
+  assert.ok(recruitRow.fulfilled_at, 'recruit fulfilled_at should be stamped after hook auto-join');
 });
 
 test('post_tool_use: busy self → does NOT auto-join', () => {

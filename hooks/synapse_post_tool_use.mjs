@@ -237,13 +237,16 @@ try {
   // §4.10 — recruit detection + atomic auto-join. Marker format:
   //   [RECRUIT] id=<uuid> from=<peerId> urgency=<l|n|h> caps=<csv>
   //             requireAll=<bool> threadId=<tid> originatorBusy=<bool>
-  // Auto-join fires only when self is idle (no peer_busy_state row) AND
-  // caps match. Single SQL transaction: thread_participants insert,
-  // reply message, mark recruit read, set self busy=RECRUIT_ENGAGED.
+  // Auto-join fires only when self is idle (no peer_busy_state row, or
+  // a CRON_ONLY row — v7.1 #3, cron loops shouldn't mask the peer as
+  // permanently busy) AND caps match. Single SQL transaction:
+  // thread_participants insert, reply message, mark recruit read, set
+  // self busy=RECRUIT_ENGAGED.
   // Failures log to stderr and skip; never block the hook.
-  const isBusy = !!db.prepare(
-    `SELECT 1 AS x FROM peer_busy_state WHERE peer_id = ?`,
+  const busyRow = db.prepare(
+    `SELECT busy_reason AS busyReason FROM peer_busy_state WHERE peer_id = ?`,
   ).get(selfId);
+  const isBusy = !!busyRow && busyRow.busyReason !== 'CRON_ONLY';
   const selfCapsRow = db.prepare(
     `SELECT capabilities FROM peers WHERE id = ?`,
   ).get(selfId);
@@ -327,6 +330,15 @@ try {
         VALUES (?, ?, 'RECRUIT_ENGAGED', NULL)
         ON CONFLICT(peer_id) DO UPDATE SET busy_at=excluded.busy_at, busy_reason=excluded.busy_reason
       `).run(selfId, now);
+
+      // v7.1 #2 — close the recruit row so the daemon GC sweep doesn't
+      // emit a stale [RECRUIT_EXPIRED] notice to the originator after
+      // it's already been answered. No-op if already fulfilled (some
+      // other peer beat us to it; race is benign).
+      db.prepare(`
+        UPDATE recruits SET fulfilled_at = ?
+        WHERE id = ? AND fulfilled_at IS NULL
+      `).run(now, recruitId);
 
       db.exec('COMMIT');
       autoJoinedNotices.push(

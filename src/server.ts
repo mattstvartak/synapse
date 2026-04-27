@@ -28,7 +28,7 @@ import {
   pruneStaleBusyState, clearAllPeerBusyState,
   appendPeerIdleEvent,
   insertRecruit, findRecentRecruit, countRecentRecruits,
-  expireRecruits, fulfillRecruit, selectRecruitProspects,
+  expireRecruits, fulfillRecruit, fulfillMatchingRecruit, selectRecruitProspects,
   type ActiveFileInfo,
   type BusyReason,
   type IdleReason,
@@ -74,13 +74,12 @@ export function createSynapseServer(initial: SynapseSession = {}): McpServer {
   // auto-state file writes so the PreToolUse hook can find them.
   let selfSessionId: string | null = initial.selfSessionId ?? null;
 
-  // §5.6(d) — message IDs returned in any synapse_poll call by this peer
-  // during this server's lifetime. Used to auto-ack on synapse_send/reply
-  // so the §5.6(a) pendingInbound alert isn't a false positive for
-  // messages the sender just polled and saw. In-memory only — daemon
-  // reconnect resets this, which is fine: a fresh server has nothing
-  // pending to false-alert about.
-  const recentlySeenMessageIds = new Set<string>();
+  // v7.1 #1 — synapse_poll now flips read_at directly via the storage-
+  // layer markRead path, so the in-memory recentlySeenMessageIds set
+  // and ackRecentlySeen() function previously needed to bridge the gap
+  // between "agent saw it" and "DB knows it" are gone. The §5.6(a)
+  // pendingInbound alert reads DB state, which is now the single source
+  // of truth for read/unread.
 
 // Session-keyed adoption order:
 // 1. CLAUDE_SESSION_ID env (cheapest, only if Claude Code exposes it).
@@ -359,21 +358,6 @@ function tryAdoptOrBootstrap(): boolean {
   catch { return false; }
 }
 
-// §5.6(d) — ack any messages this peer has been shown via a prior
-// synapse_poll in this server's lifetime, so the pendingInbound alert
-// computed afterward only counts truly unseen messages. Runs before
-// computing pendingInbound on send/reply.
-function ackRecentlySeen(): void {
-  if (recentlySeenMessageIds.size === 0) return;
-  for (const id of recentlySeenMessageIds) {
-    try { ackMessage(config, id); } catch { /* best-effort */ }
-  }
-  // After acking, drop the ids — the storage rows now carry read_at, so
-  // any future pollInboxHead naturally excludes them. Keeping the set
-  // bounded to "messages seen since last send/reply" keeps memory honest.
-  recentlySeenMessageIds.clear();
-}
-
 // §5.6(a) — pendingInbound payload added to send/reply responses so
 // the sender can't claim ignorance of inbound traffic that arrived
 // while they were drafting. Reuses the §5.4(b) pollInboxHead query —
@@ -583,10 +567,9 @@ server.registerTool(
 
     // §5.6(b) strict_inbox — check BEFORE insertMessage so a refused
     // send doesn't pollute the audit log with a "sent then warned"
-    // trace. Auto-ack first (§5.6(d)) so the strict check counts only
-    // truly-unseen messages, not messages the agent just polled.
+    // trace. v7.1 #1: poll auto-acks at storage layer, so the strict
+    // check naturally counts only truly-unseen messages.
     if (strict_inbox) {
-      ackRecentlySeen();
       const pending = computePendingInbound(from);
       if (pending.count > 0) {
         recordAudit('synapse_send', from, threadId ?? null, { to, strict_inbox: true }, 'blocked', `INBOX_NOT_DRAINED count=${pending.count}`);
@@ -672,10 +655,6 @@ server.registerTool(
     // message lands.
     clearDrafting(config, tid, from);
 
-    // §5.6(d) — ack messages the sender already saw via a prior poll,
-    // so the pendingInbound alert below isn't a false positive.
-    ackRecentlySeen();
-
     recordAudit('synapse_send', from, tid, { to: resolvedTo, messageId: id }, 'allowed');
     return json({
       messageId: id,
@@ -701,20 +680,18 @@ server.registerTool(
       since: z.string().optional().describe('ISO timestamp; only messages after this. Default: returns all unread.'),
       unreadOnly: z.boolean().optional().describe('Default true. Set false to include already-read messages within TTL.'),
       workspace: z.string().optional().describe('Filter by workspace tag.'),
+      markRead: z.boolean().optional().describe('v7.1 #1 — default true. Returned messages are flipped to read in the same call (single source of truth: DB read_at). Pass false to preview without ack — used for synapse_audit-style introspection or debugging where you want to see content but not consume it.'),
     }),
   },
-  async ({ since, unreadOnly, workspace }) => {
+  async ({ since, unreadOnly, workspace, markRead }) => {
     const self = requireSelf();
     touchPeer(config, self);
     const messages = pollInbox(config, self, {
       since,
       unreadOnly: unreadOnly !== false,
       workspace,
+      markRead: markRead !== false,
     });
-    // §5.6(d) — track ids the agent has just been shown so a subsequent
-    // synapse_send/reply can auto-ack them and skip the false-positive
-    // pendingInbound alert.
-    for (const m of messages) recentlySeenMessageIds.add(m.id);
     if (messages.length === 0) bumpCounter('poll.empty_returns');
     else bumpCounter('poll.with_results');
     return json({
@@ -816,11 +793,11 @@ server.registerTool(
     }
 
     // §5.6(b) strict_inbox — same shape as synapse_send. Pre-ack the
-    // parent (replier obviously saw it) plus recently-seen messages so
-    // the strict gate counts only truly-unseen inbound.
+    // parent (replier obviously saw it) so the strict gate counts only
+    // truly-unseen inbound. v7.1 #1: poll itself auto-acks at storage
+    // layer, so previously-seen messages are already read_at-stamped.
     if (strict_inbox) {
       try { ackMessage(config, parent.id); } catch { /* best-effort */ }
-      ackRecentlySeen();
       const pending = computePendingInbound(self);
       if (pending.count > 0) {
         recordAudit('synapse_reply', self, parent.threadId, { parentId: parent.id, strict_inbox: true }, 'blocked', `INBOX_NOT_DRAINED count=${pending.count}`);
@@ -860,11 +837,11 @@ server.registerTool(
     // §4.8 auto-clear drafting on reply — see synapse_send for rationale.
     clearDrafting(config, parent.threadId, self);
 
-    // §5.6(d) — ack already-seen messages so the §5.6(a) alert is honest.
-    // The parent message is also acked here as a side benefit (the
-    // sender obviously saw the message they're replying to).
+    // Ack the parent — replying obviously means you saw the message
+    // you're replying to, and it keeps the audit clean. v7.1 #1: any
+    // other recently-seen messages were already flipped read_at-stamped
+    // by their originating synapse_poll.
     try { ackMessage(config, parent.id); } catch { /* best-effort */ }
-    ackRecentlySeen();
 
     recordAudit('synapse_reply', self, parent.threadId, { parentId: parent.id, messageId: id }, 'allowed');
     return json({
@@ -1247,8 +1224,25 @@ server.registerTool(
     const self = requireSelf();
     touchPeer(config, self);
     const added = joinThread(config, threadId, self);
-    recordAudit('synapse_join_thread', self, threadId, { threadId }, 'allowed');
-    return json({ threadId, joined: added, alreadyJoined: !added });
+    // v7.1 #2 — close out an originating recruit on first explicit join.
+    // Only run on the freshly-added path; an already-on-roster join means
+    // the recruit (if any) was already fulfilled at the time of first
+    // touch. Older matching recruits stay open and expire normally.
+    let fulfilledRecruitId: string | null = null;
+    if (added) {
+      try { fulfilledRecruitId = fulfillMatchingRecruit(config, threadId, self); }
+      catch { /* best-effort — never fail a join because of recruit bookkeeping */ }
+    }
+    recordAudit('synapse_join_thread', self, threadId, {
+      threadId,
+      ...(fulfilledRecruitId ? { fulfilledRecruitId } : {}),
+    }, 'allowed');
+    return json({
+      threadId,
+      joined: added,
+      alreadyJoined: !added,
+      ...(fulfilledRecruitId ? { fulfilledRecruitId } : {}),
+    });
   },
 );
 

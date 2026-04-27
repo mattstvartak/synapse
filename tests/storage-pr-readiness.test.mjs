@@ -227,7 +227,9 @@ test('countOutboundAwaitingReply: excludes messages where peer has replied on sa
 // fix in commit 5ab4c7d added `read_at IS NULL` to the COUNT query and
 // removed the LIMIT 50 clamp. This test exercises the post-tool-use
 // hook's COUNT semantics against pollInbox to confirm they agree once
-// messages are acked.
+// messages are acked. v7.1 #1: poll itself auto-marks read, so the
+// preview (markRead:false) form is used here to keep the test aimed
+// at COUNT/pollInbox agreement independent of the new auto-ack path.
 test('§1.4 regression: COUNT query agrees with pollInbox after ack', async () => {
   const { ackMessage, pollInbox } = await import('../dist/storage.js');
   // PEER_A receives 3 direct messages from PEER_C (use fresh thread to
@@ -242,16 +244,76 @@ test('§1.4 regression: COUNT query agrees with pollInbox after ack', async () =
       createdAt: nowIso(), expiresAt: futureIso(), readAt: null,
     });
   }
-  // pollInbox returns 3 unread.
-  const before = pollInbox(config, PEER_A, { unreadOnly: true });
+  // Preview-poll returns 3 unread (markRead:false → no auto-ack).
+  const before = pollInbox(config, PEER_A, { unreadOnly: true, markRead: false });
   const beforeFor145 = before.filter(m => m.id.startsWith('m-145-'));
   assert.equal(beforeFor145.length, 3);
   // Ack one. The hook's COUNT query should now agree (see post-tool-use
   // implementation: same WHERE shape, plus read_at IS NULL).
   ackMessage(config, 'm-145-1');
-  const after = pollInbox(config, PEER_A, { unreadOnly: true });
+  const after = pollInbox(config, PEER_A, { unreadOnly: true, markRead: false });
   const afterFor145 = after.filter(m => m.id.startsWith('m-145-'));
   assert.equal(afterFor145.length, 2);
+});
+
+// v7.1 #1 regression — pollInbox auto-marks read; a second poll sees 0.
+test('v7.1 #1: pollInbox auto-acks; subsequent poll/head returns 0', async () => {
+  const { pollInbox, pollInboxHead } = await import('../dist/storage.js');
+  // PEER_A receives 2 direct messages from PEER_C.
+  const sharedThread = 'thread-v71-1-AC';
+  joinThread(config, sharedThread, PEER_A);
+  joinThread(config, sharedThread, PEER_C);
+  for (let i = 1; i <= 2; i++) {
+    insertMessage(config, {
+      id: `m-v71-1-${i}`, fromId: PEER_C, toId: PEER_A, threadId: sharedThread,
+      parentId: null, body: `m${i}`, workspace: null,
+      createdAt: nowIso(), expiresAt: futureIso(), readAt: null,
+    });
+  }
+  // First poll returns 2 and flips read_at on both.
+  const first = pollInbox(config, PEER_A, { unreadOnly: true });
+  const firstFor = first.filter(m => m.id.startsWith('m-v71-1-'));
+  assert.equal(firstFor.length, 2);
+  assert.ok(firstFor.every(m => m.readAt != null), 'returned messages reflect flipped read_at');
+  // Second poll (default markRead) returns nothing for those ids.
+  const second = pollInbox(config, PEER_A, { unreadOnly: true });
+  const secondFor = second.filter(m => m.id.startsWith('m-v71-1-'));
+  assert.equal(secondFor.length, 0);
+  // pollInboxHead also reflects the flip (this is the fix for hook count saturation).
+  const head = pollInboxHead(config, PEER_A, { unreadOnly: true });
+  // head.count covers all unread for PEER_A — filter our specific ids out by checking
+  // we don't see PEER_C in fromPeerIds with our messages contributing.
+  // Simpler: insert into a clean peer.
+  const PEER_FRESH = 'peer-v71-1-fresh';
+  const freshThread = 'thread-v71-1-fresh';
+  joinThread(config, freshThread, PEER_FRESH);
+  joinThread(config, freshThread, PEER_C);
+  insertMessage(config, {
+    id: 'm-v71-1-fresh', fromId: PEER_C, toId: PEER_FRESH, threadId: freshThread,
+    parentId: null, body: 'm', workspace: null,
+    createdAt: nowIso(), expiresAt: futureIso(), readAt: null,
+  });
+  assert.equal(pollInboxHead(config, PEER_FRESH).count, 1);
+  pollInbox(config, PEER_FRESH, { unreadOnly: true });
+  assert.equal(pollInboxHead(config, PEER_FRESH).count, 0);
+});
+
+// v7.1 #1 — explicit opt-out preserves preview-without-ack semantics.
+test('v7.1 #1: pollInbox markRead:false preserves unread state', async () => {
+  const { pollInbox, pollInboxHead } = await import('../dist/storage.js');
+  const PEER_OPTOUT = 'peer-v71-2-optout';
+  const optoutThread = 'thread-v71-2-optout';
+  joinThread(config, optoutThread, PEER_OPTOUT);
+  joinThread(config, optoutThread, PEER_C);
+  insertMessage(config, {
+    id: 'm-v71-2-optout', fromId: PEER_C, toId: PEER_OPTOUT, threadId: optoutThread,
+    parentId: null, body: 'm', workspace: null,
+    createdAt: nowIso(), expiresAt: futureIso(), readAt: null,
+  });
+  pollInbox(config, PEER_OPTOUT, { unreadOnly: true, markRead: false });
+  assert.equal(pollInboxHead(config, PEER_OPTOUT).count, 1, 'markRead:false leaves row unread');
+  pollInbox(config, PEER_OPTOUT, { unreadOnly: true }); // default markRead:true
+  assert.equal(pollInboxHead(config, PEER_OPTOUT).count, 0, 'default markRead:true acks');
 });
 
 test('countOutboundAwaitingReply: counts only outbound after most recent peer reply', () => {
