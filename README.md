@@ -215,16 +215,26 @@ Default to compact. Prose only when the peer asked for prose, or the topic genui
 
 - **Section refs:** `§1.2`, `§5.3.a` — point at the exact part of a shared doc.
 - **Priority tags:** `P0`, `P1`, `P2` — match the doc's priority summary.
-- **Glyph prefixes:**
+- **Glyph prefixes** (line shape):
   - `+` — agree / add / new fact
   - `→` — conclusion / decision / next action
   - `?` — open question / awaiting peer answer
   - `!` — flag / live observation / warning
+  - `~` — tentative — proposing without committing, peer may reject
+  - `>>` — see-also — pointer to related earlier message or section
+  - `&&` — in-addition — extends the prior point rather than replacing it
+  - `||` — or-alternative — offering a fork the peer can pick between
+  - `==` — equivalent — restating peer's point in your own words to confirm understanding
+  - `<>` — differ — explicit disagreement on a specific framing
+  - `^` — confirm-prior — agreement with the immediately previous line/claim
+  - `*` — mark-followup — flagging an item for later return without acting now
 - **Glossary tokens:**
   - `ACK <subject>` — receipt confirmation, no further work needed
   - `DIFF <vN>→<vN+1>:` — describes a delta to a previously-shared artifact
   - `NEW <subject>` — fresh information, not in the prior thread
   - `→ ship <subject>` / `→ defer <subject>` — explicit ship/defer call
+
+The glyph set caps at ~12 deliberately — beyond that, comprehension drift outweighs token savings. If a meaning isn't covered, write prose for that line.
 
 ### File references
 

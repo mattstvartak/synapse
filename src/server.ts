@@ -9,11 +9,13 @@ import { basename } from 'node:path';
 import { loadConfig } from './config.js';
 import {
   upsertPeer, touchPeer, listActivePeers, getPeer,
-  insertMessage, pollInbox, ackMessage, getMessage, getThread,
+  insertMessage, pollInbox, pollInboxHead, ackMessage, getMessage, getThread,
   pruneExpired, pruneStalePeers,
   getThreadState, upsertThread, closeThread, listOpenAutoThreads,
   logAudit, listAudit,
   joinThread, leaveThread, listThreadParticipants, listMyThreads,
+  listVisibleThreads,
+  setDrafting, clearDrafting, getOtherPeersDrafting,
   listActiveFiles, classifyActiveFile, deleteActiveFile,
   findActiveFileDuplicates,
   dropPeersExcept,
@@ -59,6 +61,14 @@ export function createSynapseServer(initial: SynapseSession = {}): McpServer {
   // file we adopt, or generated at bootstrap time if no hook ran. Used for
   // auto-state file writes so the PreToolUse hook can find them.
   let selfSessionId: string | null = initial.selfSessionId ?? null;
+
+  // §5.6(d) — message IDs returned in any synapse_poll call by this peer
+  // during this server's lifetime. Used to auto-ack on synapse_send/reply
+  // so the §5.6(a) pendingInbound alert isn't a false positive for
+  // messages the sender just polled and saw. In-memory only — daemon
+  // reconnect resets this, which is fine: a fresh server has nothing
+  // pending to false-alert about.
+  const recentlySeenMessageIds = new Set<string>();
 
 // Session-keyed adoption order:
 // 1. CLAUDE_SESSION_ID env (cheapest, only if Claude Code exposes it).
@@ -335,6 +345,38 @@ function tryAdoptOrBootstrap(): boolean {
   catch { return false; }
 }
 
+// §5.6(d) — ack any messages this peer has been shown via a prior
+// synapse_poll in this server's lifetime, so the pendingInbound alert
+// computed afterward only counts truly unseen messages. Runs before
+// computing pendingInbound on send/reply.
+function ackRecentlySeen(): void {
+  if (recentlySeenMessageIds.size === 0) return;
+  for (const id of recentlySeenMessageIds) {
+    try { ackMessage(config, id); } catch { /* best-effort */ }
+  }
+  // After acking, drop the ids — the storage rows now carry read_at, so
+  // any future pollInboxHead naturally excludes them. Keeping the set
+  // bounded to "messages seen since last send/reply" keeps memory honest.
+  recentlySeenMessageIds.clear();
+}
+
+// §5.6(a) — pendingInbound payload added to send/reply responses so
+// the sender can't claim ignorance of inbound traffic that arrived
+// while they were drafting. Reuses the §5.4(b) pollInboxHead query —
+// metadata only, no bodies.
+function computePendingInbound(self: string): {
+  count: number;
+  fromPeerIds: string[];
+  oldestUnreadAgeSec: number | null;
+} {
+  const head = pollInboxHead(config, self);
+  return {
+    count: head.count,
+    fromPeerIds: head.fromPeerIds,
+    oldestUnreadAgeSec: head.oldestUnreadAgeSec,
+  };
+}
+
 function requireSelf(): string {
   if (!selfId) tryAdoptIntoSelf();
   if (!selfId) {
@@ -516,12 +558,25 @@ server.registerTool(
     // even if `to` is a direct peer ID — keeps thread_state consistent.
     joinThread(config, tid, from);
 
+    // §4.8 — sending IS the "done drafting" signal. Auto-clear so peers
+    // waiting on a wait_reply see the drafting flag drop the moment the
+    // message lands.
+    clearDrafting(config, tid, from);
+
+    // §5.6(d) — ack messages the sender already saw via a prior poll,
+    // so the pendingInbound alert below isn't a false positive.
+    ackRecentlySeen();
+
     recordAudit('synapse_send', from, tid, { to, messageId: id }, 'allowed');
     return json({
       messageId: id,
       threadId: tid,
       expiresAt,
       suggestedNext: { tool: 'synapse_wait_reply', messageId: id },
+      // §5.6(a) — surfaced in the response so the sender can pivot to
+      // synapse_poll before their next outbound if anything new arrived
+      // while they were drafting.
+      pendingInbound: computePendingInbound(from),
     });
   },
 );
@@ -547,9 +602,46 @@ server.registerTool(
       unreadOnly: unreadOnly !== false,
       workspace,
     });
+    // §5.6(d) — track ids the agent has just been shown so a subsequent
+    // synapse_send/reply can auto-ack them and skip the false-positive
+    // pendingInbound alert.
+    for (const m of messages) recentlySeenMessageIds.add(m.id);
     return json({
       count: messages.length,
       messages,
+      serverHealth: {
+        mcpPid: process.pid,
+        respondedAt: new Date().toISOString(),
+      },
+    });
+  },
+);
+
+// ── synapse_poll_head ─────────────────────────────────────────────
+
+server.registerTool(
+  'synapse_poll_head',
+  {
+    title: 'Poll Inbox (HEAD)',
+    description: 'Lightweight check for unread messages — returns count, oldest_unread_age_sec, from_peer_ids, and serverHealth, but NO message bodies. ~50 tokens vs ~300-1500 for synapse_poll. Use as the cheap "is there anything?" probe; call synapse_poll only when count > 0. Same filter semantics (since, unreadOnly, workspace) as synapse_poll.',
+    inputSchema: z.object({
+      since: z.string().optional().describe('ISO timestamp; only messages after this. Default: returns all unread.'),
+      unreadOnly: z.boolean().optional().describe('Default true. Set false to include already-read messages within TTL.'),
+      workspace: z.string().optional().describe('Filter by workspace tag.'),
+    }),
+  },
+  async ({ since, unreadOnly, workspace }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    const head = pollInboxHead(config, self, {
+      since,
+      unreadOnly: unreadOnly !== false,
+      workspace,
+    });
+    return json({
+      count: head.count,
+      oldestUnreadAgeSec: head.oldestUnreadAgeSec,
+      fromPeerIds: head.fromPeerIds,
       serverHealth: {
         mcpPid: process.pid,
         respondedAt: new Date().toISOString(),
@@ -618,12 +710,23 @@ server.registerTool(
     };
     insertMessage(config, reply);
     joinThread(config, parent.threadId, self);
+    // §4.8 auto-clear drafting on reply — see synapse_send for rationale.
+    clearDrafting(config, parent.threadId, self);
+
+    // §5.6(d) — ack already-seen messages so the §5.6(a) alert is honest.
+    // The parent message is also acked here as a side benefit (the
+    // sender obviously saw the message they're replying to).
+    try { ackMessage(config, parent.id); } catch { /* best-effort */ }
+    ackRecentlySeen();
+
     recordAudit('synapse_reply', self, parent.threadId, { parentId: parent.id, messageId: id }, 'allowed');
     return json({
       messageId: id,
       threadId: parent.threadId,
       expiresAt,
       suggestedNext: { tool: 'synapse_wait_reply', messageId: id },
+      // §5.6(a) — see synapse_send.
+      pendingInbound: computePendingInbound(self),
     });
   },
 );
@@ -736,8 +839,53 @@ server.registerTool(
       await new Promise<void>(resolve => setTimeout(resolve, Math.min(interval, remaining)));
     }
 
+    // Timeout — surface peer drafting state so the caller knows whether
+    // to keep waiting or assume idle. Cheap query; only on the timeout
+    // branch since the replied branch carries the actual message.
+    const peersDrafting = getOtherPeersDrafting(config, targetThread, self);
     recordAudit('synapse_wait_reply', self, targetThread, { messageId }, 'allowed', 'timeout');
-    return json({ status: 'timeout', timeoutSec: timeoutSec ?? 60 });
+    return json({
+      status: 'timeout',
+      timeoutSec: timeoutSec ?? 60,
+      peersDrafting,
+    });
+  },
+);
+
+// ── synapse_set_drafting ──────────────────────────────────────────
+
+server.registerTool(
+  'synapse_set_drafting',
+  {
+    title: 'Announce Drafting',
+    description: 'Mark this peer as actively drafting a reply on the given thread. Other peers calling synapse_wait_reply on the same thread will see `peersDrafting` in their timeout response so they know to keep waiting instead of assuming idle. Auto-cleared by the next synapse_send/reply on the same thread from this peer.',
+    inputSchema: z.object({
+      threadId: z.string().describe('Thread being drafted on.'),
+      etaSec: z.number().int().positive().max(900).optional().describe('Optional ETA in seconds (max 15 min). Helps the waiting peer pick a wait_reply timeout.'),
+    }),
+  },
+  async ({ threadId, etaSec }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    setDrafting(config, threadId, self, etaSec ?? null);
+    return json({ ok: true, threadId, peerId: self, etaSec: etaSec ?? null });
+  },
+);
+
+// ── synapse_clear_drafting ────────────────────────────────────────
+
+server.registerTool(
+  'synapse_clear_drafting',
+  {
+    title: 'Clear Drafting Announcement',
+    description: 'Cancel a prior synapse_set_drafting announcement without sending a message. Use when you decide not to reply after all (synapse_send/reply auto-clear, so you only need this for "decided not to send").',
+    inputSchema: z.object({
+      threadId: z.string(),
+    }),
+  },
+  async ({ threadId }) => {
+    const self = requireSelf();
+    return json({ cleared: clearDrafting(config, threadId, self) });
   },
 );
 
@@ -910,6 +1058,23 @@ server.registerTool(
   async () => {
     const self = requireSelf();
     return json({ threadIds: listMyThreads(config, self) });
+  },
+);
+
+// ── synapse_threads_visible ───────────────────────────────────────
+
+server.registerTool(
+  'synapse_threads_visible',
+  {
+    title: 'List Visible Threads (Discovery)',
+    description: 'Threads where any peer-I\'ve-messaged is participating but I am NOT yet on the roster. Read-only metadata only — threadId, participant count, distinct participant labels, last-message age. Use to discover relevant ongoing conversations without fan-in. Call synapse_join_thread to actually opt into one.',
+    inputSchema: z.object({
+      limit: z.number().optional().describe('Max threads to return (default 50).'),
+    }),
+  },
+  async ({ limit }) => {
+    const self = requireSelf();
+    return json({ threads: listVisibleThreads(config, self, limit ?? 50) });
   },
 );
 

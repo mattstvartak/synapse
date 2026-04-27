@@ -67,11 +67,60 @@ function writeDaemonState(dataDir: string, state: DaemonState): void {
   writeFileSync(daemonStatePath(dataDir), JSON.stringify(state, null, 2), 'utf-8');
 }
 
-// identityToken → peerId binding. Lives in-memory for now; daemon restart
-// loses bindings and clients re-mint. Survives client reconnects, which is
-// the property that matters. SQLite-backed persistence is a follow-up so
-// peer IDs survive daemon restart on VPS.
-const identityBindings = new Map<string, { peerId: string; label: string }>();
+// identityToken → peerId binding. Persisted to <dataDir>/daemon-bindings.json
+// so daemon restart preserves sticky identity per (label, token). Without
+// persistence, every daemon restart minted a fresh peerId for each shim,
+// failing the "no identity divergence" success criterion (§1.6 in the
+// PR-readiness proposal). Loaded once at daemon startup, written on every
+// new bind. Reads are pure in-memory.
+interface IdentityBinding {
+  peerId: string;
+  label: string;
+  // lastUsedAt is informational — supports future cleanup of long-stale
+  // bindings (e.g. a label that hasn't reconnected in 30 days).
+  lastUsedAt: string;
+}
+
+const identityBindings = new Map<string, IdentityBinding>();
+let bindingsDataDir: string | null = null;
+
+function bindingsPath(dataDir: string): string {
+  return join(dataDir, 'daemon-bindings.json');
+}
+
+function loadIdentityBindings(dataDir: string): void {
+  bindingsDataDir = dataDir;
+  identityBindings.clear();
+  const path = bindingsPath(dataDir);
+  if (!existsSync(path)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, IdentityBinding>;
+    for (const [token, binding] of Object.entries(parsed)) {
+      if (!binding || typeof binding.peerId !== 'string' || typeof binding.label !== 'string') continue;
+      identityBindings.set(token, {
+        peerId: binding.peerId,
+        label: binding.label,
+        lastUsedAt: binding.lastUsedAt ?? new Date().toISOString(),
+      });
+    }
+  } catch (err) {
+    process.stderr.write(`synapse-daemon: failed to load daemon-bindings.json: ${(err as Error).message}\n`);
+  }
+}
+
+function persistIdentityBindings(): void {
+  if (!bindingsDataDir) return;
+  const obj: Record<string, IdentityBinding> = {};
+  for (const [token, binding] of identityBindings) obj[token] = binding;
+  try {
+    mkdirSync(bindingsDataDir, { recursive: true });
+    writeFileSync(bindingsPath(bindingsDataDir), JSON.stringify(obj, null, 2), 'utf-8');
+  } catch (err) {
+    // Best-effort — never throw inside resolveIdentity. Log and continue
+    // (the binding is still in-memory; next bind will retry the write).
+    process.stderr.write(`synapse-daemon: failed to persist daemon-bindings.json: ${(err as Error).message}\n`);
+  }
+}
 
 // Per-MCP-session transport map. Key = MCP session ID assigned by SDK.
 const transports = new Map<string, StreamableHTTPServerTransport>();
@@ -119,6 +168,8 @@ function resolveIdentity(
 ): ResolvedIdentity {
   const config = loadConfig({ dataDir });
 
+  const nowIso = new Date().toISOString();
+
   if (identityToken) {
     const existing = identityBindings.get(identityToken);
     if (existing && existing.label === label) {
@@ -126,34 +177,37 @@ function resolveIdentity(
       const peer = getPeer(config, existing.peerId);
       if (peer) {
         touchPeer(config, existing.peerId);
-        return { peerId: existing.peerId, label, identityToken };
+      } else {
+        // Peer row got cleaned up since the binding was made. Re-insert with
+        // the same id so identity stays sticky across cleanup events.
+        upsertPeer(config, {
+          id: existing.peerId,
+          label,
+          registeredAt: nowIso,
+          lastSeenAt: nowIso,
+          capabilities: null,
+        });
       }
-      // Peer row got cleaned up since the binding was made. Re-insert with
-      // the same id so identity stays sticky across cleanup events.
-      const now = new Date().toISOString();
-      upsertPeer(config, {
-        id: existing.peerId,
-        label,
-        registeredAt: now,
-        lastSeenAt: now,
-        capabilities: null,
-      });
+      // Touch lastUsedAt + persist so a long-quiet binding stays fresh on
+      // disk and future cleanup heuristics don't reap it.
+      existing.lastUsedAt = nowIso;
+      persistIdentityBindings();
       return { peerId: existing.peerId, label, identityToken };
     }
   }
 
   // New client OR token didn't resolve: mint fresh.
   const peerId = generateClientId(label);
-  const now = new Date().toISOString();
   upsertPeer(config, {
     id: peerId,
     label,
-    registeredAt: now,
-    lastSeenAt: now,
+    registeredAt: nowIso,
+    lastSeenAt: nowIso,
     capabilities: null,
   });
   const token = identityToken ?? randomUUID();
-  identityBindings.set(token, { peerId, label });
+  identityBindings.set(token, { peerId, label, lastUsedAt: nowIso });
+  persistIdentityBindings();
   return { peerId, label, identityToken: token };
 }
 
@@ -284,6 +338,12 @@ export async function runDaemon(): Promise<void> {
   const config = loadConfig();
   const paths = buildIdentityPaths(config.dataDir);
   void paths;
+
+  // §1.6 — load persisted identity bindings before accepting any traffic.
+  // Without this, every daemon restart minted a new peerId per shim
+  // despite the shim's identity-token file persisting — failing the "no
+  // identity divergence" success criterion.
+  loadIdentityBindings(config.dataDir);
 
   // Reuse existing token if a previous daemon wrote one — clients that
   // saved it are still valid. New token only when daemon.json is absent.

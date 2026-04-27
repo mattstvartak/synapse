@@ -73,4 +73,18 @@ export const INIT_SCHEMA_SQL = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_participants_peer ON thread_participants(peer_id);
+
+  -- §4.8 typing presence. A peer can announce "I'm drafting a reply on
+  -- thread X, ETA Y seconds" so wait_reply callers know whether to keep
+  -- waiting or assume the peer is idle. Rows are short-lived; auto-cleared
+  -- on next synapse_send/reply by the same peer on the same thread, or
+  -- explicitly via synapse_clear_drafting, or by TTL when the daemon
+  -- next prunes (see clearStaleDrafting in storage.ts).
+  CREATE TABLE IF NOT EXISTS drafting_state (
+    thread_id  TEXT NOT NULL,
+    peer_id    TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    eta_at     TEXT,
+    PRIMARY KEY (thread_id, peer_id)
+  );
 `;

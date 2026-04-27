@@ -193,6 +193,83 @@ export function pollInbox(
   `).all(...params) as unknown as Message[];
 }
 
+export interface InboxHead {
+  count: number;
+  oldestUnreadAgeSec: number | null;
+  fromPeerIds: string[];
+}
+
+// HEAD-style inbox check — same WHERE shape as pollInbox but returns
+// only counts + sender list, no message bodies. Used by synapse_poll_head
+// to give the agent a cheap "is there anything?" check (~50 tokens vs
+// ~300-1500 for full poll). Paired with full poll only when count > 0.
+export function pollInboxHead(
+  config: SynapseConfig,
+  selfId: string,
+  opts: PollOptions = {},
+): InboxHead {
+  pruneExpired(config);
+  const { since, unreadOnly = true, workspace } = opts;
+
+  const where: string[] = [
+    `(
+       to_id = ?
+       OR (to_id = 'broadcast' AND from_id != ?)
+       OR (
+         to_id LIKE 'thread:%'
+         AND from_id != ?
+         AND EXISTS (
+           SELECT 1 FROM thread_participants tp
+           WHERE tp.thread_id = messages.thread_id
+             AND tp.peer_id   = ?
+         )
+       )
+     )`,
+    `expires_at >= ?`,
+  ];
+  const params: (string | number)[] = [
+    selfId, selfId, selfId, selfId, new Date().toISOString(),
+  ];
+
+  if (unreadOnly) where.push(`read_at IS NULL`);
+  if (since) {
+    where.push(`created_at > ?`);
+    params.push(since);
+  }
+  if (workspace) {
+    where.push(`workspace = ?`);
+    params.push(workspace);
+  }
+
+  const whereSql = where.join(' AND ');
+  const db = getDb(config);
+
+  const aggRow = db.prepare(`
+    SELECT COUNT(*) AS n,
+           MIN(created_at) AS oldest
+    FROM messages
+    WHERE ${whereSql}
+  `).get(...params) as { n: number; oldest: string | null } | undefined;
+
+  const count = Number(aggRow?.n ?? 0);
+  const oldest = aggRow?.oldest ?? null;
+  const oldestUnreadAgeSec = oldest
+    ? Math.floor((Date.now() - new Date(oldest).getTime()) / 1000)
+    : null;
+
+  if (count === 0) return { count: 0, oldestUnreadAgeSec: null, fromPeerIds: [] };
+
+  const senderRows = db.prepare(`
+    SELECT DISTINCT from_id AS fromId
+    FROM messages
+    WHERE ${whereSql}
+    LIMIT 20
+  `).all(...params) as Array<{ fromId: string }>;
+  const fromPeerIds = senderRows.map(r => r.fromId);
+
+  return { count, oldestUnreadAgeSec, fromPeerIds };
+}
+
 export function ackMessage(config: SynapseConfig, messageId: string): boolean {
   const result = getDb(config).prepare(
     `UPDATE messages SET read_at = ? WHERE id = ? AND read_at IS NULL`,
@@ -403,6 +480,176 @@ export function listMyThreads(
     ORDER BY joined_at DESC
   `).all(peerId);
   return (rows as Array<{ threadId: string }>).map(r => r.threadId);
+}
+
+// §4.8 typing presence. A peer announces "I'm drafting on thread X, ETA Ys"
+// so wait_reply callers know whether to keep waiting. Auto-cleared by the
+// next synapse_send/reply from the same peer on the same thread (the act
+// of sending IS the "done drafting" signal).
+
+export interface DraftingState {
+  threadId: string;
+  peerId: string;
+  startedAt: string;
+  etaAt: string | null;
+  startedAgeSec: number;
+  etaInSec: number | null;
+}
+
+export function setDrafting(
+  config: SynapseConfig,
+  threadId: string,
+  peerId: string,
+  etaSec: number | null,
+): void {
+  const now = new Date();
+  const etaAt = etaSec !== null && Number.isFinite(etaSec) && etaSec > 0
+    ? new Date(now.getTime() + etaSec * 1000).toISOString()
+    : null;
+  getDb(config).prepare(`
+    INSERT INTO drafting_state (thread_id, peer_id, started_at, eta_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(thread_id, peer_id) DO UPDATE SET
+      started_at = excluded.started_at,
+      eta_at     = excluded.eta_at
+  `).run(threadId, peerId, now.toISOString(), etaAt);
+}
+
+export function clearDrafting(
+  config: SynapseConfig,
+  threadId: string,
+  peerId: string,
+): boolean {
+  const result = getDb(config).prepare(
+    `DELETE FROM drafting_state WHERE thread_id = ? AND peer_id = ?`,
+  ).run(threadId, peerId);
+  return Number(result.changes) > 0;
+}
+
+// Drafting state for all peers currently drafting on a thread, EXCLUDING
+// the caller. The caller's own drafting state isn't useful to itself.
+export function getOtherPeersDrafting(
+  config: SynapseConfig,
+  threadId: string,
+  excludePeerId: string,
+): DraftingState[] {
+  const rows = getDb(config).prepare(`
+    SELECT thread_id  AS threadId,
+           peer_id    AS peerId,
+           started_at AS startedAt,
+           eta_at     AS etaAt
+    FROM drafting_state
+    WHERE thread_id = ? AND peer_id != ?
+  `).all(threadId, excludePeerId) as Array<{
+    threadId: string; peerId: string; startedAt: string; etaAt: string | null;
+  }>;
+
+  const now = Date.now();
+  return rows.map(r => ({
+    threadId: r.threadId,
+    peerId: r.peerId,
+    startedAt: r.startedAt,
+    etaAt: r.etaAt,
+    startedAgeSec: Math.floor((now - new Date(r.startedAt).getTime()) / 1000),
+    etaInSec: r.etaAt
+      ? Math.max(0, Math.floor((new Date(r.etaAt).getTime() - now) / 1000))
+      : null,
+  }));
+}
+
+// §2.4 — Threads where any peer I've messaged is participating, but I'm
+// NOT already on the roster. Read-only discovery surface; agents call
+// synapse_join_thread explicitly to opt in. Returns per-thread metadata
+// only (no message bodies) so the agent can decide whether the thread
+// is worth joining without fetching content.
+export interface VisibleThread {
+  threadId: string;
+  participantCount: number;
+  participantLabels: string[];
+  lastMessageAt: string | null;
+  lastMessageAgeSec: number | null;
+}
+
+export function listVisibleThreads(
+  config: SynapseConfig,
+  selfId: string,
+  limit = 50,
+): VisibleThread[] {
+  pruneExpired(config);
+  const db = getDb(config);
+
+  // Rows: threadId + participantCount + lastMessageAt for threads that
+  //   - have at least one participant matching a peer I've messaged
+  //     (direct send or direct receive — broadcasts and thread-fanouts
+  //     don't count because they're not relationship-establishing)
+  //   - I'm NOT on the roster of
+  //   - have at least one non-expired message (filters dead/empty threads)
+  const rows = db.prepare(`
+    WITH my_known_peers AS (
+      SELECT DISTINCT to_id AS peer_id
+      FROM messages
+      WHERE from_id = ?
+        AND to_id != 'broadcast'
+        AND to_id NOT LIKE 'thread:%'
+        AND to_id != ?
+      UNION
+      SELECT DISTINCT from_id AS peer_id
+      FROM messages
+      WHERE to_id = ?
+        AND from_id != ?
+    )
+    SELECT v.thread_id AS threadId,
+           (SELECT COUNT(*) FROM thread_participants WHERE thread_id = v.thread_id) AS participantCount,
+           (SELECT MAX(created_at) FROM messages WHERE thread_id = v.thread_id AND expires_at >= ?) AS lastMessageAt
+    FROM (
+      SELECT DISTINCT tp.thread_id
+      FROM thread_participants tp
+      WHERE tp.peer_id IN (SELECT peer_id FROM my_known_peers)
+        AND tp.thread_id NOT IN (
+          SELECT thread_id FROM thread_participants WHERE peer_id = ?
+        )
+    ) v
+    WHERE (SELECT MAX(created_at) FROM messages WHERE thread_id = v.thread_id AND expires_at >= ?) IS NOT NULL
+    ORDER BY lastMessageAt DESC
+    LIMIT ?
+  `).all(
+    selfId, selfId,
+    selfId, selfId,
+    new Date().toISOString(),
+    selfId,
+    new Date().toISOString(),
+    limit,
+  ) as Array<{ threadId: string; participantCount: number; lastMessageAt: string | null }>;
+
+  if (rows.length === 0) return [];
+
+  // Fetch participant labels per thread in one round trip.
+  const threadIds = rows.map(r => r.threadId);
+  const placeholders = threadIds.map(() => '?').join(',');
+  const labelRows = db.prepare(`
+    SELECT tp.thread_id AS threadId,
+           p.label AS label
+    FROM thread_participants tp
+    JOIN peers p ON p.id = tp.peer_id
+    WHERE tp.thread_id IN (${placeholders})
+  `).all(...threadIds) as Array<{ threadId: string; label: string }>;
+
+  const labelsByThread = new Map<string, Set<string>>();
+  for (const row of labelRows) {
+    if (!labelsByThread.has(row.threadId)) labelsByThread.set(row.threadId, new Set());
+    labelsByThread.get(row.threadId)!.add(row.label);
+  }
+
+  const now = Date.now();
+  return rows.map(r => ({
+    threadId: r.threadId,
+    participantCount: r.participantCount,
+    participantLabels: Array.from(labelsByThread.get(r.threadId) ?? []).sort(),
+    lastMessageAt: r.lastMessageAt,
+    lastMessageAgeSec: r.lastMessageAt
+      ? Math.floor((now - new Date(r.lastMessageAt).getTime()) / 1000)
+      : null,
+  }));
 }
 
 // Return the most recent thread (by latest non-expired message) where

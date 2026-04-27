@@ -20,6 +20,11 @@ import {
   joinThread,
   findRecentSharedThread,
   countOutboundAwaitingReply,
+  pollInboxHead,
+  listVisibleThreads,
+  setDrafting,
+  clearDrafting,
+  getOtherPeersDrafting,
 } from '../dist/storage.js';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'synapse-pr-test-'));
@@ -264,4 +269,114 @@ test('countOutboundAwaitingReply: counts only outbound after most recent peer re
   const result = countOutboundAwaitingReply(config, PEER_F);
   assert.equal(result.count, 1);
   assert.ok(result.oldestAgeSec >= 59 && result.oldestAgeSec <= 80);
+});
+
+// §5.4(b) pollInboxHead — same filter shape as pollInbox but no bodies.
+test('pollInboxHead: returns count + fromPeerIds + oldestUnreadAgeSec, no bodies', async () => {
+  const head = pollInboxHead(config, PEER_F);
+  // PEER_F has m-mixed-FG-2 unread on its inbox (G's reply to F).
+  assert.ok(head.count >= 1);
+  assert.ok(head.fromPeerIds.includes(PEER_G));
+  assert.ok(head.oldestUnreadAgeSec !== null);
+  // No bodies in payload.
+  assert.equal(head.messages, undefined);
+  assert.equal(head.body, undefined);
+});
+
+test('pollInboxHead: returns zeroed shape when nothing pending', () => {
+  // PEER_C in this test file has only sent messages, no unread inbound.
+  // (cross-checked by inspecting earlier setup: PEER_C never received
+  // a direct un-acked message.)
+  const head = pollInboxHead(config, 'code-zzzzzzzz-no-inbox');
+  upsertPeer(config, { id: 'code-zzzzzzzz-no-inbox', label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  const head2 = pollInboxHead(config, 'code-zzzzzzzz-no-inbox');
+  assert.equal(head2.count, 0);
+  assert.equal(head2.oldestUnreadAgeSec, null);
+  assert.deepEqual(head2.fromPeerIds, []);
+});
+
+// §2.4 listVisibleThreads — discovery for threads with peers I've messaged.
+test('listVisibleThreads: shows thread where known peer is on roster, I am not', () => {
+  // Create peers H (me) and I (a peer I'll message), and J (third party).
+  const PEER_H = 'code-hhhhhhhh';
+  const PEER_I = 'cowork-iiiiiiii';
+  const PEER_J = 'desktop-jjjjjjjj';
+  upsertPeer(config, { id: PEER_H, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  upsertPeer(config, { id: PEER_I, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  upsertPeer(config, { id: PEER_J, label: 'desktop', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+
+  // I directly message I — this establishes "I'm a peer H has messaged."
+  insertMessage(config, {
+    id: 'm-vis-HI-1', fromId: PEER_H, toId: PEER_I, threadId: 't-vis-HI',
+    parentId: null, body: 'hi I', workspace: null,
+    createdAt: pastIso(10), expiresAt: futureIso(), readAt: null,
+  });
+  joinThread(config, 't-vis-HI', PEER_H);
+  joinThread(config, 't-vis-HI', PEER_I);
+
+  // I and J converse on a separate thread H is NOT on. Should be visible to H.
+  joinThread(config, 't-vis-IJ', PEER_I);
+  joinThread(config, 't-vis-IJ', PEER_J);
+  insertMessage(config, {
+    id: 'm-vis-IJ-1', fromId: PEER_I, toId: PEER_J, threadId: 't-vis-IJ',
+    parentId: null, body: 'hi J', workspace: null,
+    createdAt: pastIso(5), expiresAt: futureIso(), readAt: null,
+  });
+
+  const visible = listVisibleThreads(config, PEER_H);
+  const tIJ = visible.find(t => t.threadId === 't-vis-IJ');
+  assert.ok(tIJ, 't-vis-IJ should be visible to H');
+  assert.equal(tIJ.participantCount, 2);
+  assert.ok(tIJ.participantLabels.includes('cowork'));
+  assert.ok(tIJ.participantLabels.includes('desktop'));
+  // Threads H is already on must NOT show in visible.
+  const tHI = visible.find(t => t.threadId === 't-vis-HI');
+  assert.equal(tHI, undefined);
+});
+
+test('listVisibleThreads: empty when peer has no relationships', () => {
+  const PEER_LONE = 'code-lonelone';
+  upsertPeer(config, { id: PEER_LONE, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  const visible = listVisibleThreads(config, PEER_LONE);
+  assert.equal(visible.length, 0);
+});
+
+// §4.8 drafting state — set/clear/get round trip.
+test('setDrafting + getOtherPeersDrafting: peer A sees peer B drafting, not self', () => {
+  const PEER_K = 'code-kkkkkkkk';
+  const PEER_L = 'cowork-llllllll';
+  upsertPeer(config, { id: PEER_K, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  upsertPeer(config, { id: PEER_L, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+
+  setDrafting(config, 't-draft-KL', PEER_L, 60);
+  setDrafting(config, 't-draft-KL', PEER_K, 30); // self also drafting
+
+  // From K's perspective: only L drafting (self excluded).
+  const fromK = getOtherPeersDrafting(config, 't-draft-KL', PEER_K);
+  assert.equal(fromK.length, 1);
+  assert.equal(fromK[0].peerId, PEER_L);
+  assert.ok(fromK[0].etaInSec !== null);
+  assert.ok(fromK[0].etaInSec <= 60 && fromK[0].etaInSec >= 50);
+
+  // From L's perspective: only K drafting.
+  const fromL = getOtherPeersDrafting(config, 't-draft-KL', PEER_L);
+  assert.equal(fromL.length, 1);
+  assert.equal(fromL[0].peerId, PEER_K);
+});
+
+test('clearDrafting: removes the row', () => {
+  const PEER_M = 'cowork-mmmmmmmm';
+  upsertPeer(config, { id: PEER_M, label: 'cowork', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setDrafting(config, 't-clear-M', PEER_M, null);
+  const beforeClear = getOtherPeersDrafting(config, 't-clear-M', 'code-x');
+  assert.equal(beforeClear.length, 1);
+  const cleared = clearDrafting(config, 't-clear-M', PEER_M);
+  assert.equal(cleared, true);
+  const afterClear = getOtherPeersDrafting(config, 't-clear-M', 'code-x');
+  assert.equal(afterClear.length, 0);
+});
+
+test('clearDrafting: returns false when nothing to clear', () => {
+  const cleared = clearDrafting(config, 't-nonexistent', 'cowork-nope');
+  assert.equal(cleared, false);
 });
