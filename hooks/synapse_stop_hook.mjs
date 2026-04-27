@@ -117,6 +117,17 @@ try {
   // 1. Heartbeat (existing behavior).
   db.prepare(`UPDATE peers SET last_seen_at = ? WHERE id = ?`).run(now, selfId);
 
+  // §4.10 — busy → idle transition. UserPromptSubmit set this peer busy
+  // for the duration of the turn; clear the row now that the turn is
+  // ending and append a peer_idle_log entry so recruit-prospect sort
+  // sees fresh-idle signal. Default reason USER_DONE (turn just ended).
+  // Explicit user-driven reasons (CRON_ONLY, EXPLICIT_AWAY, etc.) flow
+  // through synapse_set_idle({ reason }) which appends its own row.
+  db.prepare(`DELETE FROM peer_busy_state WHERE peer_id = ?`).run(selfId);
+  db.prepare(`
+    INSERT INTO peer_idle_log (peer_id, idle_at, idle_reason) VALUES (?, ?, 'USER_DONE')
+  `).run(selfId, now);
+
   // 2. Cheap unread poll. Mirror inbox visibility from storage.ts pollInbox:
   //    direct, broadcast (from others), or thread-scoped where I'm a participant.
   //    DON'T mark read here — UserPromptSubmit will surface bodies next turn

@@ -202,13 +202,16 @@ try {
     emitNothing();
   }
 
-  // Cheap second query for sender labels — only fired when we have
-  // inbound to surface. Capped at LIMIT 5 since labels are display
-  // hints, not the authoritative count.
+  // Body-bearing fetch — supports C (inline preview) + §4.10 recruit
+  // detection. LIMIT 5 keeps it cheap; recruit markers + ack-class bodies
+  // are short. The bodies feed sender labels, inline preview, and recruit
+  // marker parsing in a single pass.
+  let unreadBodies = [];
   let senderLabels = [];
   if (inboundCount > 0) {
-    const labelRows = db.prepare(`
-      SELECT DISTINCT COALESCE(p.label, m.from_id) AS senderLabel
+    unreadBodies = db.prepare(`
+      SELECT m.id, m.from_id AS fromId, m.thread_id AS threadId,
+             m.body, COALESCE(p.label, m.from_id) AS senderLabel
       FROM messages m
       LEFT JOIN peers p ON p.id = m.from_id
       WHERE (
@@ -225,9 +228,116 @@ try {
       )
       AND m.expires_at >= ?
       AND m.read_at IS NULL
+      ORDER BY m.created_at ASC
       LIMIT 5
     `).all(selfId, selfId, selfId, selfId, now);
-    senderLabels = labelRows.map(r => r.senderLabel).filter(Boolean);
+    senderLabels = [...new Set(unreadBodies.map(r => r.senderLabel).filter(Boolean))];
+  }
+
+  // §4.10 — recruit detection + atomic auto-join. Marker format:
+  //   [RECRUIT] id=<uuid> from=<peerId> urgency=<l|n|h> caps=<csv>
+  //             requireAll=<bool> threadId=<tid> originatorBusy=<bool>
+  // Auto-join fires only when self is idle (no peer_busy_state row) AND
+  // caps match. Single SQL transaction: thread_participants insert,
+  // reply message, mark recruit read, set self busy=RECRUIT_ENGAGED.
+  // Failures log to stderr and skip; never block the hook.
+  const isBusy = !!db.prepare(
+    `SELECT 1 AS x FROM peer_busy_state WHERE peer_id = ?`,
+  ).get(selfId);
+  const selfCapsRow = db.prepare(
+    `SELECT capabilities FROM peers WHERE id = ?`,
+  ).get(selfId);
+  let selfCaps = [];
+  try {
+    selfCaps = selfCapsRow?.capabilities ? JSON.parse(selfCapsRow.capabilities) : [];
+    if (!Array.isArray(selfCaps)) selfCaps = [];
+  } catch { selfCaps = []; }
+
+  function parseRecruitMarker(line) {
+    const out = {};
+    const tail = line.replace(/^\[RECRUIT\]\s+/, '');
+    for (const pair of tail.split(/\s+/)) {
+      const eq = pair.indexOf('=');
+      if (eq < 0) continue;
+      out[pair.slice(0, eq)] = pair.slice(eq + 1);
+    }
+    return out;
+  }
+
+  const autoJoinedNotices = [];
+  const autoJoinSkippedNotices = [];
+  const recruitExpiredNotices = [];
+
+  for (const m of unreadBodies) {
+    const firstLine = (m.body ?? '').split('\n', 1)[0] ?? '';
+    if (firstLine.startsWith('[RECRUIT_EXPIRED]')) {
+      recruitExpiredNotices.push(firstLine);
+      continue;
+    }
+    if (!firstLine.startsWith('[RECRUIT]')) continue;
+
+    const fields = parseRecruitMarker(firstLine);
+    const recruitId = fields.id ?? '?';
+    const targetThreadId = fields.threadId;
+    const fromPeerId = fields.from;
+    const requireAll = fields.requireAll === 'true';
+    const recruitCaps = (fields.caps ?? '').split(',').filter(Boolean);
+
+    if (fromPeerId === selfId) continue; // self-recruit edge case
+    if (!targetThreadId) {
+      autoJoinSkippedNotices.push(`recruit ${recruitId} skipped (no threadId)`);
+      continue;
+    }
+
+    let capsMatch;
+    if (recruitCaps.length === 0) capsMatch = true;
+    else if (requireAll) capsMatch = recruitCaps.every(c => selfCaps.includes(c));
+    else capsMatch = recruitCaps.some(c => selfCaps.includes(c));
+
+    if (!capsMatch) {
+      autoJoinSkippedNotices.push(
+        `recruit ${recruitId} caps mismatch (need ${recruitCaps.join(',')}, have ${selfCaps.join(',') || 'none'})`,
+      );
+      continue;
+    }
+    if (isBusy) {
+      autoJoinSkippedNotices.push(`recruit ${recruitId} skipped (self busy)`);
+      continue;
+    }
+
+    try {
+      db.exec('BEGIN');
+      db.prepare(`
+        INSERT OR IGNORE INTO thread_participants (thread_id, peer_id, joined_at)
+        VALUES (?, ?, ?)
+      `).run(targetThreadId, selfId, now);
+
+      const replyId = `${selfId.slice(0, 12)}-recruit-${recruitId.slice(0, 8)}-${Date.now()}`;
+      const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
+      const replyBody = `I'm in. caps=[${selfCaps.join(',') || 'none'}]`;
+      db.prepare(`
+        INSERT INTO messages (id, from_id, to_id, thread_id, parent_id, body, workspace, created_at, expires_at, read_at)
+        VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL)
+      `).run(replyId, selfId, `thread:${targetThreadId}`, targetThreadId, replyBody, now, expiresAt);
+
+      db.prepare(`UPDATE messages SET read_at = ? WHERE id = ?`).run(now, m.id);
+
+      db.prepare(`
+        INSERT INTO peer_busy_state (peer_id, busy_at, busy_reason, shim_fingerprint)
+        VALUES (?, ?, 'RECRUIT_ENGAGED', NULL)
+        ON CONFLICT(peer_id) DO UPDATE SET busy_at=excluded.busy_at, busy_reason=excluded.busy_reason
+      `).run(selfId, now);
+
+      db.exec('COMMIT');
+      autoJoinedNotices.push(
+        `recruit ${recruitId} auto-joined on thread ${targetThreadId.slice(0, 8)}…`,
+      );
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* nothing to rollback */ }
+      autoJoinSkippedNotices.push(
+        `recruit ${recruitId} auto-join failed: ${err?.message ?? err}`,
+      );
+    }
   }
 
   db.close();
@@ -254,6 +364,38 @@ try {
     );
     const ageAttr = outboundOldestAgeSec !== null ? ` oldest_age_sec="${outboundOldestAgeSec}"` : '';
     lines.push(`<outbound_awaiting_reply count="${outboundCount}"${ageAttr}/>`);
+  }
+
+  // §4.10 recruit results — surface auto-joins, expiry notices, and
+  // diagnostic skip reasons. Auto-joins are informational; the model
+  // sees them and knows it's now a thread participant.
+  for (const note of autoJoinedNotices) {
+    lines.push(`[!] SYNAPSE: ${note}`);
+  }
+  for (const note of recruitExpiredNotices) {
+    lines.push(`[!] SYNAPSE: ${note}`);
+  }
+  for (const note of autoJoinSkippedNotices) {
+    lines.push(`<recruit_skipped reason="${note.replace(/"/g, '&quot;')}"/>`);
+  }
+
+  // C — inline body preview. For ≤3 unread short messages (≤200 char
+  // bodies, non-recruit), surface the body inline so ack-class messages
+  // ("ok", "shipped") don't force a poll roundtrip. Recruit markers are
+  // surfaced separately above; long bodies still require synapse_poll.
+  if (inboundCount > 0 && inboundCount <= 3) {
+    for (const m of unreadBodies) {
+      const firstLine = (m.body ?? '').split('\n', 1)[0] ?? '';
+      if (firstLine.startsWith('[RECRUIT]')) continue;
+      if (firstLine.startsWith('[RECRUIT_EXPIRED]')) continue;
+      const body = m.body ?? '';
+      if (body.length > 200) continue;
+      lines.push(
+        `<peer_input_preview from="${m.fromId}" id="${m.id}" thread="${m.threadId}">`,
+      );
+      lines.push(body);
+      lines.push(`</peer_input_preview>`);
+    }
   }
 
   emitContext(lines.join('\n'));
