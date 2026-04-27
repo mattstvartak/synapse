@@ -39,6 +39,7 @@ import {
   pruneStaleIdleLog,
   expireRecruits, insertMessage,
   listThreadParticipants,
+  writePeerAlias, logAudit,
   type RecruitRow,
 } from './storage.js';
 import type { Message, SynapseConfig } from './types.js';
@@ -477,6 +478,15 @@ function handleHealth(res: http.ServerResponse): void {
   });
 }
 
+// §1.6(c) — heartbeat staleness threshold above which a priorPeerId is
+// considered "cold" (process exited, identity rotated). Anything below
+// this is a warm contention case that §1.11 already handles. Tunable
+// via env so tests can shorten the window without waiting in real time.
+const COLD_RESTART_STALE_SEC = Number.parseInt(
+  process.env.SYNAPSE_COLD_RESTART_STALE_SEC ?? '600',
+  10,
+);
+
 async function handleIdentity(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -487,7 +497,12 @@ async function handleIdentity(
     send(res, 401, { error: 'unauthorized' });
     return;
   }
-  let body: { label?: string; identityToken?: string; sessionFingerprint?: string };
+  let body: {
+    label?: string;
+    identityToken?: string;
+    sessionFingerprint?: string;
+    priorPeerId?: string;
+  };
   try { body = (await readBody(req)) as typeof body ?? {}; }
   catch (err) {
     send(res, 400, { error: 'invalid json', detail: (err as Error).message });
@@ -501,6 +516,9 @@ async function handleIdentity(
   const sessionFingerprint = typeof body.sessionFingerprint === 'string'
     ? body.sessionFingerprint.trim()
     : null;
+  const priorPeerId = typeof body.priorPeerId === 'string'
+    ? body.priorPeerId.trim()
+    : null;
   let identity: ResolvedIdentity;
   try {
     identity = resolveIdentity(label, body.identityToken ?? null, dataDir, sessionFingerprint);
@@ -511,10 +529,56 @@ async function handleIdentity(
     }
     throw err;
   }
+
+  // §1.6(c) cold-restart aliasing — when the shim-side identity file
+  // remembered a peerId that's now different from the freshly-resolved
+  // one, this is a peerId rotation across a process boundary (NOT a
+  // warm §1.11 contention rebind, which keeps the same peerId via the
+  // identity-token path). Register the alias so messages still in flight
+  // to the old id route to the new one. Only when the prior is truly
+  // gone (heartbeat older than the cold-restart threshold) — a fresh
+  // prior heartbeat means another shim is alive on it; that's a §1.11
+  // contention case, not a cold rotation.
+  let aliasRegistered = false;
+  if (priorPeerId && priorPeerId !== identity.peerId) {
+    try {
+      const config = loadConfig({ dataDir });
+      const prior = getPeer(config, priorPeerId);
+      if (prior) {
+        const lastSeenMs = new Date(prior.lastSeenAt).getTime();
+        const ageSec = Math.max(0, Math.floor((Date.now() - lastSeenMs) / 1000));
+        if (ageSec >= COLD_RESTART_STALE_SEC) {
+          writePeerAlias(config, priorPeerId, identity.peerId);
+          aliasRegistered = true;
+          bumpCounter('identityBindings.cold_alias_writes');
+          try {
+            logAudit(config, {
+              id: randomUUID(),
+              toolName: 'peer_cold_alias',
+              callerId: identity.peerId,
+              threadId: null,
+              originThreadId: null,
+              originMessageId: null,
+              argsHash: '',
+              result: 'allowed',
+              reason: `from=${priorPeerId} to=${identity.peerId} lastSeenAgeSec=${ageSec}`,
+              calledAt: new Date().toISOString(),
+            });
+          } catch { /* best-effort — never fail /identity for audit */ }
+        }
+        // else: prior is fresh → §1.11 contention case, no alias.
+      }
+      // else: prior peer doesn't exist (fresh dataDir or pruned) — silently skip.
+    } catch (err) {
+      process.stderr.write(`synapse-daemon: cold-alias write failed: ${(err as Error).message}\n`);
+    }
+  }
+
   send(res, 200, {
     peerId: identity.peerId,
     identityToken: identity.identityToken,
     label: identity.label,
+    ...(aliasRegistered ? { coldAliasRegistered: { from: priorPeerId, to: identity.peerId } } : {}),
   });
 }
 

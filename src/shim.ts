@@ -168,6 +168,7 @@ async function tryBindIdentity(
   state: DaemonState,
   label: string,
   identityToken: string,
+  priorPeerId?: string,
 ): Promise<BindAttempt> {
   const url = (process.env.SYNAPSE_DAEMON_URL ?? `http://127.0.0.1:${state.port}`).replace(/\/$/, '');
   const res = await fetch(`${url}/identity`, {
@@ -180,6 +181,15 @@ async function tryBindIdentity(
       label,
       identityToken,
       sessionFingerprint: SHIM_SESSION_FINGERPRINT,
+      // §1.6(c) cold-restart aliasing — the peerId carried by the
+      // identity file from the last shim boot. Daemon uses it to
+      // register `priorPeerId → resolvedPeerId` when a fresh peerId
+      // is minted (e.g., persisted bindings dropped) so messages
+      // addressed to the dead id auto-canonicalize to the live one.
+      // The check is one-shot at /identity time; thereafter the
+      // alias chain handles routing. Omitted when there's no prior
+      // (first-boot in this dataDir).
+      ...(priorPeerId ? { priorPeerId } : {}),
     }),
   });
   if (res.status === 409) {
@@ -212,8 +222,10 @@ async function negotiateIdentity(
   // First attempt: use the sticky identity-token from <label>-identity.json.
   // The first concurrent session per label always wins this — its peerId
   // stays stable across reconnects, which is the whole point of the sticky
-  // file.
-  const sticky = await tryBindIdentity(state, label, identity.identityToken);
+  // file. Pass identity.peerId as priorPeerId for §1.6(c) — daemon writes
+  // an alias if a fresh peerId is minted (e.g., persisted bindings dropped
+  // between shim restarts) so the dead id still routes.
+  const sticky = await tryBindIdentity(state, label, identity.identityToken, identity.peerId);
   if (!sticky.contention) {
     const updated: IdentityFile = {
       identityToken: sticky.identityToken ?? identity.identityToken,
