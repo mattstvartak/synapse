@@ -28,6 +28,11 @@ import {
   clearDrafting,
   getOtherPeersDrafting,
   setPeerCapabilities,
+  getPeerCapabilities,
+  addPeerCapabilities,
+  removePeerCapabilities,
+  writePeerAlias,
+  resolvePeerAlias,
 } from '../dist/storage.js';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'synapse-pr-test-'));
@@ -400,6 +405,69 @@ test('setPeerCapabilities: empty array clears to NULL', () => {
   setPeerCapabilities(config, PEER, []);
   const peer = getPeer(config, PEER);
   assert.equal(peer.capabilities, null);
+});
+
+// §4.7 stage-6.1 add/remove
+test('addPeerCapabilities: merges into existing without overwriting', () => {
+  const PEER = 'code-cap3';
+  upsertPeer(config, { id: PEER, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setPeerCapabilities(config, PEER, ['fs', 'git']);
+  const merged = addPeerCapabilities(config, PEER, ['browser', 'figma', 'fs']);
+  assert.deepEqual(merged, ['browser', 'figma', 'fs', 'git']);
+  assert.deepEqual(getPeerCapabilities(config, PEER), ['browser', 'figma', 'fs', 'git']);
+});
+
+test('addPeerCapabilities: idempotent on existing tags', () => {
+  const PEER = 'code-cap4';
+  upsertPeer(config, { id: PEER, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setPeerCapabilities(config, PEER, ['x', 'y']);
+  const merged = addPeerCapabilities(config, PEER, ['x']);
+  assert.deepEqual(merged, ['x', 'y']);
+});
+
+test('removePeerCapabilities: drops specified tags', () => {
+  const PEER = 'code-cap5';
+  upsertPeer(config, { id: PEER, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setPeerCapabilities(config, PEER, ['fs', 'git', 'browser', 'figma']);
+  const remaining = removePeerCapabilities(config, PEER, ['git', 'figma']);
+  assert.deepEqual(remaining, ['browser', 'fs']);
+});
+
+test('removePeerCapabilities: idempotent on missing tags', () => {
+  const PEER = 'code-cap6';
+  upsertPeer(config, { id: PEER, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setPeerCapabilities(config, PEER, ['x']);
+  const remaining = removePeerCapabilities(config, PEER, ['y', 'z']);
+  assert.deepEqual(remaining, ['x']);
+});
+
+test('removePeerCapabilities: removing all clears to NULL', () => {
+  const PEER = 'code-cap7';
+  upsertPeer(config, { id: PEER, label: 'code', registeredAt: setupNow, lastSeenAt: setupNow, capabilities: null });
+  setPeerCapabilities(config, PEER, ['only']);
+  removePeerCapabilities(config, PEER, ['only']);
+  const peer = getPeer(config, PEER);
+  assert.equal(peer.capabilities, null);
+});
+
+// §1.6 stage-6.1 alias resolution
+test('writePeerAlias + resolvePeerAlias: round-trip basic', () => {
+  writePeerAlias(config, 'code-old-1', 'code-new-1');
+  assert.equal(resolvePeerAlias(config, 'code-old-1'), 'code-new-1');
+  // Non-aliased ids return self.
+  assert.equal(resolvePeerAlias(config, 'code-not-aliased'), 'code-not-aliased');
+});
+
+test('writePeerAlias: chain collapse — A→B then B→C makes both A and B point to C', () => {
+  writePeerAlias(config, 'code-chain-A', 'code-chain-B');
+  writePeerAlias(config, 'code-chain-B', 'code-chain-C');
+  assert.equal(resolvePeerAlias(config, 'code-chain-A'), 'code-chain-C');
+  assert.equal(resolvePeerAlias(config, 'code-chain-B'), 'code-chain-C');
+});
+
+test('writePeerAlias: self-pointing alias is no-op', () => {
+  writePeerAlias(config, 'code-selfptr', 'code-selfptr');
+  assert.equal(resolvePeerAlias(config, 'code-selfptr'), 'code-selfptr');
 });
 
 // §4.8 implicit drafting

@@ -232,21 +232,31 @@ try {
 
   db.close();
 
-  const markers = [];
+  // §1.10 fix (b) — directive-line copy. Bare counts are easy to scan
+  // past; concrete next-actions trigger behavior.
+  const lines = [];
   if (inboundCount > 0) {
     const labelsAttr = senderLabels.length
       ? ` labels="${senderLabels.join(', ').replace(/"/g, '&quot;')}"`
       : '';
-    markers.push(`<peer_input_pending count="${inboundCount}"${labelsAttr}/>`);
+    lines.push(
+      `[!] SYNAPSE: ${inboundCount} unread message${inboundCount === 1 ? '' : 's'}` +
+      (senderLabels.length ? ` from ${senderLabels.join(', ')}` : '') +
+      `. Run synapse_poll before next outbound to avoid stale-context send (§5.6).`
+    );
+    lines.push(`<peer_input_pending count="${inboundCount}"${labelsAttr}/>`);
   }
   if (outboundCount > 0) {
-    const ageAttr = outboundOldestAgeSec !== null
-      ? ` oldest_age_sec="${outboundOldestAgeSec}"`
-      : '';
-    markers.push(`<outbound_awaiting_reply count="${outboundCount}"${ageAttr}/>`);
+    const ageHint = outboundOldestAgeSec !== null ? ` (oldest ${outboundOldestAgeSec}s ago)` : '';
+    lines.push(
+      `[!] SYNAPSE: ${outboundCount} outbound message${outboundCount === 1 ? '' : 's'} awaiting reply${ageHint}. ` +
+      `Consider synapse_wait_reply or synapse_poll before treating the conversation as complete.`
+    );
+    const ageAttr = outboundOldestAgeSec !== null ? ` oldest_age_sec="${outboundOldestAgeSec}"` : '';
+    lines.push(`<outbound_awaiting_reply count="${outboundCount}"${ageAttr}/>`);
   }
 
-  emitContext(markers.join(''));
+  emitContext(lines.join('\n'));
 } catch (err) {
   process.stderr.write(`synapse post-tool-use hook: ${err && err.stack ? err.stack : err}\n`);
   emitNothing();

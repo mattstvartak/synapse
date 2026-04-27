@@ -565,6 +565,54 @@ export function setPeerCapabilities(
   ).run(json, peerId);
 }
 
+// Helper used by add/remove tools — read current capabilities as a parsed
+// array, return [] for null / parse-error.
+export function getPeerCapabilities(
+  config: SynapseConfig,
+  peerId: string,
+): string[] {
+  const row = getDb(config).prepare(
+    `SELECT capabilities FROM peers WHERE id = ?`,
+  ).get(peerId) as { capabilities: string | null } | undefined;
+  if (!row || !row.capabilities) return [];
+  try {
+    const parsed = JSON.parse(row.capabilities);
+    return Array.isArray(parsed) ? parsed.filter(t => typeof t === 'string') : [];
+  } catch { return []; }
+}
+
+// §4.7 additive tool — merges new tags into existing set without
+// stomping. Sender registers a fresh capability without having to
+// re-list everything they already advertised. Idempotent: adding a
+// tag already present is a no-op.
+export function addPeerCapabilities(
+  config: SynapseConfig,
+  peerId: string,
+  tagsToAdd: string[],
+): string[] {
+  const current = getPeerCapabilities(config, peerId);
+  const merged = Array.from(new Set([
+    ...current,
+    ...tagsToAdd.filter(t => typeof t === 'string' && t.length > 0),
+  ])).sort();
+  setPeerCapabilities(config, peerId, merged);
+  return merged;
+}
+
+// §4.7 additive tool — removes specific tags from the existing set.
+// Idempotent: removing a tag not present is a no-op.
+export function removePeerCapabilities(
+  config: SynapseConfig,
+  peerId: string,
+  tagsToRemove: string[],
+): string[] {
+  const current = getPeerCapabilities(config, peerId);
+  const removeSet = new Set(tagsToRemove);
+  const remaining = current.filter(t => !removeSet.has(t)).sort();
+  setPeerCapabilities(config, peerId, remaining);
+  return remaining;
+}
+
 // §4.8 typing presence. A peer announces "I'm drafting on thread X, ETA Ys"
 // so wait_reply callers know whether to keep waiting. Auto-cleared by the
 // next synapse_send/reply from the same peer on the same thread (the act

@@ -36,6 +36,7 @@ import {
   findActiveFileDuplicates,
   getPeerGcMultiplier,
   listActiveFiles,
+  writePeerAlias,
 } from '../dist/storage.js';
 import { INIT_SCHEMA_SQL } from '../dist/schema.js';
 import { loadConfig } from '../dist/config.js';
@@ -106,6 +107,9 @@ async function resolveIdentityViaDaemon(dataDir, label) {
   if (!identity || typeof identity.identityToken !== 'string') {
     identity = { identityToken: randomUUID() };
   }
+  // Capture previous peerId BEFORE the daemon probe so caller can
+  // write an A→B alias if daemon returns a different id.
+  const previousPeerId = (typeof identity.peerId === 'string') ? identity.peerId : null;
 
   // Probe daemon /identity with hard timeout.
   const url = `http://127.0.0.1:${state.port}/identity`;
@@ -139,7 +143,11 @@ async function resolveIdentityViaDaemon(dataDir, label) {
     }, null, 2), 'utf-8');
   } catch { /* best-effort */ }
 
-  return { peerId: payload.peerId, identityToken: identity.identityToken };
+  return {
+    peerId: payload.peerId,
+    identityToken: identity.identityToken,
+    previousPeerId,
+  };
 }
 
 const label = parseLabel();
@@ -200,6 +208,20 @@ try {
     // Touch in case the daemon's resolveIdentity didn't already (it does
     // on existing-binding hits; on fresh mint the daemon also upserts).
     db.prepare(`UPDATE peers SET last_seen_at = ? WHERE id = ?`).run(now, selfId);
+    // §1.6 stage-6.1 alias-write-trigger — when this token previously
+    // resolved to a different peer-id (e.g. last session minted A via
+    // fallback bootstrap; this session daemon returns B), write A→B
+    // alias so messages still addressed to the stale id auto-redirect.
+    // resolveIdentityViaDaemon captured previousPeerId from the
+    // identity-token file before overwriting it.
+    if (daemonIdentity.previousPeerId && daemonIdentity.previousPeerId !== selfId) {
+      try {
+        const cfgForAlias = loadConfig({ dataDir });
+        writePeerAlias(cfgForAlias, daemonIdentity.previousPeerId, selfId);
+      } catch (err) {
+        process.stderr.write(`synapse session-start hook: alias-write failed: ${err && err.message ? err.message : err}\n`);
+      }
+    }
   } else {
     // Fallback: legacy hook-bootstrap path. Daemon was unreachable / no
     // bindings file / fetch failed. Hook mints a peerId so the session

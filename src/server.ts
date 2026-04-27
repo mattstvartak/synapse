@@ -16,7 +16,7 @@ import {
   joinThread, leaveThread, listThreadParticipants, listMyThreads,
   listVisibleThreads,
   setDrafting, clearDrafting, markImplicitDrafting, getOtherPeersDrafting,
-  setPeerCapabilities,
+  setPeerCapabilities, addPeerCapabilities, removePeerCapabilities,
   resolvePeerAlias,
   listActiveFiles, classifyActiveFile, deleteActiveFile,
   findActiveFileDuplicates,
@@ -734,6 +734,23 @@ server.registerTool(
     const parent = getMessage(config, messageId);
     if (!parent) throw new Error(`Message ${messageId} not found.`);
 
+    // §1.8 — reject self-loopback. synapse_reply auto-routes to the
+    // parent's fromId on the same thread; if the parent was authored by
+    // the caller, the reply lands back in their own inbox (own outbound
+    // = own inbound). Almost always operator error: caller meant
+    // synapse_send for fresh outbound on the same thread, or
+    // synapse_reply on a peer's message. Hard-error per cowork's
+    // "silent fixes hide bugs" preference.
+    if (parent.fromId === self) {
+      recordAudit('synapse_reply', self, parent.threadId, { parentId: parent.id }, 'blocked', 'INVALID_REPLY_TARGET self-loopback');
+      bumpCounter('reply.self_loopback_blocks');
+      throw new Error(
+        `INVALID_REPLY_TARGET: cannot reply to your own message (${messageId}). ` +
+        `synapse_reply auto-routes to the parent's sender, which would loop back to you. ` +
+        `Use synapse_send({ to: <peer>, threadId: "${parent.threadId}", body }) for fresh outbound on this thread.`,
+      );
+    }
+
     // §5.6(b) strict_inbox — same shape as synapse_send. Pre-ack the
     // parent (replier obviously saw it) plus recently-seen messages so
     // the strict gate counts only truly-unseen inbound.
@@ -949,8 +966,8 @@ server.registerTool(
 server.registerTool(
   'synapse_register_capabilities',
   {
-    title: 'Advertise Capabilities',
-    description: 'Set this peer\'s capability tags so senders can route by capability instead of label. Examples: "code", "browser", "figma", "fs", "git", "supports_drafting_signal", "dialect_v0". Tags are surfaced via synapse_peers and inform §4.8 / §5.5 / future routing logic. Idempotent — call again to overwrite.',
+    title: 'Advertise Capabilities (Full Replace)',
+    description: 'Set this peer\'s capability tags as a complete set so senders can route by capability instead of label. Examples: "code", "browser", "figma", "fs", "git", "supports_drafting_signal", "dialect_v0". Tags are surfaced via synapse_peers and inform §4.8 / §5.5 / future routing logic. Idempotent FULL REPLACE — call with [] to clear. For incremental edits, use synapse_add_capability or synapse_remove_capability instead.',
     inputSchema: z.object({
       tags: z.array(z.string().min(1).max(64)).max(32).describe('Capability tags. Deduplicated server-side and stored sorted for stable comparison. Pass [] to clear.'),
     }),
@@ -962,6 +979,44 @@ server.registerTool(
     // Echo the cleaned + sorted set back so callers can verify.
     const cleaned = Array.from(new Set(tags)).sort();
     return json({ ok: true, peerId: self, capabilities: cleaned });
+  },
+);
+
+// ── synapse_add_capability ────────────────────────────────────────
+
+server.registerTool(
+  'synapse_add_capability',
+  {
+    title: 'Add Capability Tags (Incremental)',
+    description: 'Merge new capability tags into this peer\'s existing set without overwriting. Idempotent — adding a tag already present is a no-op. Use when registering a new capability you just gained (e.g. a tool became available) without having to re-list every existing tag. For full-replace semantics, use synapse_register_capabilities.',
+    inputSchema: z.object({
+      tags: z.array(z.string().min(1).max(64)).max(32).describe('Capability tags to merge in. Deduplicated server-side; resulting set stored sorted.'),
+    }),
+  },
+  async ({ tags }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    const merged = addPeerCapabilities(config, self, tags);
+    return json({ ok: true, peerId: self, capabilities: merged });
+  },
+);
+
+// ── synapse_remove_capability ─────────────────────────────────────
+
+server.registerTool(
+  'synapse_remove_capability',
+  {
+    title: 'Remove Capability Tags (Incremental)',
+    description: 'Remove specific capability tags from this peer\'s existing set. Idempotent — removing a tag not present is a no-op. Use when a capability becomes unavailable (e.g. a tool is no longer reachable, a workspace was unmounted) without having to re-list every remaining tag.',
+    inputSchema: z.object({
+      tags: z.array(z.string().min(1).max(64)).max(32).describe('Capability tags to remove. Tags not currently set are silently skipped.'),
+    }),
+  },
+  async ({ tags }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    const remaining = removePeerCapabilities(config, self, tags);
+    return json({ ok: true, peerId: self, capabilities: remaining });
   },
 );
 

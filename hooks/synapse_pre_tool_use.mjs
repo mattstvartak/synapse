@@ -23,6 +23,7 @@
  *   SYNAPSE_DATA_DIR default ~/.claude/synapse
  */
 
+import { DatabaseSync } from 'node:sqlite';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -38,12 +39,172 @@ function emit(obj) {
   process.exit(0);
 }
 
-function approve() {
-  emit({ decision: 'approve' });
+// approve() optionally carries an additionalContext payload so the
+// hook can surface inbox markers BEFORE the tool runs (§1.10 fix). The
+// model sees the marker on the SAME turn, not the next one.
+function approve(additionalContext) {
+  if (additionalContext) {
+    emit({
+      decision: 'approve',
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        additionalContext,
+      },
+    });
+  } else {
+    emit({ decision: 'approve' });
+  }
 }
 
 function block(reason) {
   emit({ decision: 'block', reason });
+}
+
+// §1.10 fix — find this peer's selfId by reading the session-keyed
+// active file (same logic as post-tool-use hook). Returns null if no
+// active file is reachable; caller approves without surfacing.
+function findSelfId(dataDir, label, sessionId, peerTimeoutSec) {
+  if (sessionId) {
+    const candidate = join(dataDir, `active-${label}-${sessionId}.json`);
+    if (existsSync(candidate)) {
+      try {
+        const parsed = JSON.parse(readFileSync(candidate, 'utf-8'));
+        if (parsed?.id) return parsed.id;
+      } catch { /* fall through */ }
+    }
+  }
+  let entries;
+  try { entries = readdirSync(dataDir); } catch { return null; }
+  const prefix = `active-${label}-`;
+  const cutoff = Date.now() - peerTimeoutSec * 1000;
+  let bestId = null, bestMtime = -Infinity;
+  for (const name of entries) {
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue;
+    const full = join(dataDir, name);
+    let stat;
+    try { stat = statSync(full); } catch { continue; }
+    if (stat.mtimeMs < cutoff) continue;
+    if (stat.mtimeMs <= bestMtime) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(full, 'utf-8'));
+      if (parsed?.id) { bestMtime = stat.mtimeMs; bestId = parsed.id; }
+    } catch { /* skip */ }
+  }
+  return bestId;
+}
+
+// §1.10 fix — read the inbox + outbound state and compose marker text
+// for surfacing. Returns null if nothing is pending (caller emits a
+// plain approve). Returns markdown-ish text when there's something to
+// surface; caller wraps it as additionalContext.
+function composeInboxMarkers(dataDir, selfId) {
+  const dbPath = join(dataDir, 'synapse.db');
+  if (!existsSync(dbPath)) return null;
+  let db;
+  try {
+    db = new DatabaseSync(dbPath);
+    db.exec(`PRAGMA journal_mode = WAL`);
+  } catch { return null; }
+  try {
+    const now = new Date().toISOString();
+    // Inbound count + sender labels (§5.4(b) HEAD shape).
+    const inboundRow = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM messages
+      WHERE (
+        to_id = ?
+        OR (to_id = 'broadcast' AND from_id != ?)
+        OR (
+          to_id LIKE 'thread:%'
+          AND from_id != ?
+          AND EXISTS (
+            SELECT 1 FROM thread_participants tp
+            WHERE tp.thread_id = messages.thread_id AND tp.peer_id = ?
+          )
+        )
+      )
+      AND expires_at >= ?
+      AND read_at IS NULL
+    `).get(selfId, selfId, selfId, selfId, now);
+    const inboundCount = Number(inboundRow?.n ?? 0);
+
+    // Outbound awaiting reply (§2.3 mirror).
+    const outboundRow = db.prepare(`
+      SELECT COUNT(*) AS n,
+             MIN(m.created_at) AS oldest
+      FROM messages m
+      WHERE m.from_id = ?
+        AND m.expires_at >= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM messages r
+          WHERE r.thread_id = m.thread_id
+            AND r.from_id != ?
+            AND r.created_at > m.created_at
+        )
+    `).get(selfId, now, selfId);
+    const outboundCount = Number(outboundRow?.n ?? 0);
+    const outboundOldest = outboundRow?.oldest ?? null;
+    const outboundOldestAgeSec = outboundOldest
+      ? Math.floor((Date.now() - new Date(outboundOldest).getTime()) / 1000)
+      : null;
+
+    if (inboundCount === 0 && outboundCount === 0) return null;
+
+    let senderLabels = [];
+    if (inboundCount > 0) {
+      const labelRows = db.prepare(`
+        SELECT DISTINCT COALESCE(p.label, m.from_id) AS senderLabel
+        FROM messages m
+        LEFT JOIN peers p ON p.id = m.from_id
+        WHERE (
+          m.to_id = ?
+          OR (m.to_id = 'broadcast' AND m.from_id != ?)
+          OR (
+            m.to_id LIKE 'thread:%'
+            AND m.from_id != ?
+            AND EXISTS (
+              SELECT 1 FROM thread_participants tp
+              WHERE tp.thread_id = m.thread_id AND tp.peer_id = ?
+            )
+          )
+        )
+        AND m.expires_at >= ?
+        AND m.read_at IS NULL
+        LIMIT 5
+      `).all(selfId, selfId, selfId, selfId, now);
+      senderLabels = labelRows.map(r => r.senderLabel).filter(Boolean);
+    }
+
+    // Compose loud marker text per §1.10 fix (b) — directive line that
+    // tells the model what to do, not just a bare count.
+    const lines = [];
+    if (inboundCount > 0) {
+      const labelsAttr = senderLabels.length
+        ? ` labels="${senderLabels.join(', ').replace(/"/g, '&quot;')}"`
+        : '';
+      lines.push(
+        `[!] SYNAPSE: ${inboundCount} unread message${inboundCount === 1 ? '' : 's'}` +
+        (senderLabels.length ? ` from ${senderLabels.join(', ')}` : '') +
+        `. Run synapse_poll before next outbound to avoid stale-context send (§5.6).`
+      );
+      lines.push(`<peer_input_pending count="${inboundCount}"${labelsAttr}/>`);
+    }
+    if (outboundCount > 0) {
+      const ageHint = outboundOldestAgeSec !== null ? ` (oldest ${outboundOldestAgeSec}s ago)` : '';
+      lines.push(
+        `[!] SYNAPSE: ${outboundCount} outbound message${outboundCount === 1 ? '' : 's'} awaiting reply${ageHint}. ` +
+        `Consider synapse_wait_reply or synapse_poll before treating the conversation as complete.`
+      );
+      const ageAttr = outboundOldestAgeSec !== null ? ` oldest_age_sec="${outboundOldestAgeSec}"` : '';
+      lines.push(`<outbound_awaiting_reply count="${outboundCount}"${ageAttr}/>`);
+    }
+    return lines.join('\n');
+  } catch (err) {
+    process.stderr.write(`synapse pre-tool-use inbox surfacing: ${err && err.stack ? err.stack : err}\n`);
+    return null;
+  } finally {
+    try { db.close(); } catch { /* nope */ }
+  }
 }
 
 async function readStdin() {
@@ -104,6 +265,7 @@ try {
 
   const dataDir = process.env.SYNAPSE_DATA_DIR ?? join(homedir(), '.claude', 'synapse');
   const PPID = process.ppid;
+  const peerTimeoutSec = parseInt(process.env.SYNAPSE_PEER_TIMEOUT_SECONDS ?? '600', 10);
 
   // Read stdin first so we can extract session_id before locating state file.
   const raw = await readStdin();
@@ -114,23 +276,31 @@ try {
   }
   const sessionId = (typeof payload?.session_id === 'string') ? payload.session_id : null;
 
+  // §1.10 fix — compute inbox surfacing BEFORE the auto-mode block check,
+  // so even when auto-mode is active the markers still surface (the model
+  // gets the inbox context even if the tool is about to be blocked).
+  // approve() and block() both will get the surfacing attached when
+  // there's something to surface. Returns null when inbox is clean.
+  const selfId = findSelfId(dataDir, label, sessionId, peerTimeoutSec);
+  const inboxMarkers = selfId ? composeInboxMarkers(dataDir, selfId) : null;
+
   const statePath = findAutoStateFile(dataDir, label, sessionId, PPID);
-  if (!statePath) approve();
+  if (!statePath) approve(inboxMarkers);
 
   let state;
   try { state = JSON.parse(readFileSync(statePath, 'utf-8')); }
-  catch { approve(); }
+  catch { approve(inboxMarkers); }
 
   if (!existsSync(POLICY_PATH)) {
     process.stderr.write(`synapse pre-tool-use: policy file missing at ${POLICY_PATH}\n`);
-    approve();
+    approve(inboxMarkers);
   }
 
   let policy;
   try { policy = JSON.parse(readFileSync(POLICY_PATH, 'utf-8')); }
   catch (err) {
     process.stderr.write(`synapse pre-tool-use: policy parse error: ${err}\n`);
-    approve();
+    approve(inboxMarkers);
   }
 
   const toolName = payload?.tool_name ?? '';
@@ -146,7 +316,7 @@ try {
     );
   }
 
-  approve();
+  approve(inboxMarkers);
 } catch (err) {
   process.stderr.write(`synapse pre-tool-use hook: ${err && err.stack ? err.stack : err}\n`);
   // Fail-open: don't brick tool use on hook bugs.
