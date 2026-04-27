@@ -23,36 +23,49 @@ npm install
 npm run build
 ```
 
-Then point one or more Claude clients at the built server. Each client config sets `SYNAPSE_LABEL` to the human-friendly identity that window will broadcast as.
+Both Claude Code and Claude Desktop should point at `dist/cli.js shim` rather than `dist/server.js` directly. The shim is a thin stdio→HTTP proxy that connects to a single long-lived `synapse-mcp daemon` process; the daemon owns the SQLite handle and the actual MCP server logic. Benefits:
 
-### Claude Code (`~/.claude/settings.json`)
+- Restarting synapse picks up new code globally — kill the daemon once and every connected shim's next probe respawns it with fresh `dist/`.
+- One SQLite handle (cleaner WAL semantics across sessions).
+- Sticky identity per label across `/mcp` reconnects (`<dataDir>/<label>-identity.json`).
 
-The repo's hooks live in `synapse/hooks/`. Wire them under `hooks` in `settings.json` so they run for every session:
+The daemon auto-spawns on first shim launch (see `src/shim.ts`), so there's no separate "start the daemon" step.
+
+### Claude Code (`~/.claude.json` → per-project `mcpServers`)
 
 ```json
 {
-  "mcpServers": {
-    "synapse": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/absolute/path/to/synapse/dist/server.js", "--label=code"]
-    }
-  },
-  "hooks": {
-    "SessionStart":     [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/synapse/hooks/synapse_session_start.mjs --label=code" }] }],
-    "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/synapse/hooks/synapse_user_prompt.mjs --label=code" }] }],
-    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/synapse/hooks/synapse_pre_tool_use.mjs --label=code" }] }],
-    "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/synapse/hooks/synapse_post_tool_use.mjs --label=code" }] }],
-    "Stop":             [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /absolute/path/to/synapse/hooks/synapse_stop_hook.mjs --label=code" }] }]
+  "synapse": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "C:/absolute/path/to/synapse/dist/cli.js",
+      "shim"
+    ],
+    "env": { "SYNAPSE_LABEL": "code" }
   }
 }
 ```
 
-The `--label=code` argv on each hook is the *default*. To run a single Claude Code window under a different label (e.g. `cowork`), set `SYNAPSE_LABEL=cowork` in that window's environment **before** launching `claude`. Env beats argv — see [Identity & label resolution](#identity--label-resolution).
+Hooks wire separately under `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart":     [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node \"C:/absolute/path/to/synapse/hooks/synapse_session_start.mjs\" --label=code" }] }],
+    "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node \"C:/absolute/path/to/synapse/hooks/synapse_user_prompt.mjs\" --label=code" }] }],
+    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node \"C:/absolute/path/to/synapse/hooks/synapse_pre_tool_use.mjs\" --label=code" }] }],
+    "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node \"C:/absolute/path/to/synapse/hooks/synapse_post_tool_use.mjs\" --label=code" }] }],
+    "Stop":             [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node \"C:/absolute/path/to/synapse/hooks/synapse_stop_hook.mjs\" --label=code" }] }]
+  }
+}
+```
+
+The `--label=code` argv is the *default*. To run a single Claude Code window under a different label (e.g. `cowork`), set `SYNAPSE_LABEL=cowork` in that window's environment **before** launching `claude`. Env beats argv — see [Identity & label resolution](#identity--label-resolution).
 
 ### Claude Desktop (`%APPDATA%\Claude\claude_desktop_config.json`)
 
-Desktop has no SessionStart hook. The server self-bootstraps from `SYNAPSE_LABEL` on startup, so all you need is:
+Desktop has no SessionStart hook. The shim's daemon-spawn handles identity adoption; just set the label in env:
 
 ```json
 {
@@ -60,14 +73,17 @@ Desktop has no SessionStart hook. The server self-bootstraps from `SYNAPSE_LABEL
     "synapse": {
       "type": "stdio",
       "command": "node",
-      "args": ["C:/absolute/path/to/synapse/dist/server.js"],
+      "args": [
+        "C:/absolute/path/to/synapse/dist/cli.js",
+        "shim"
+      ],
       "env": { "SYNAPSE_LABEL": "desktop" }
     }
   }
 }
 ```
 
-The peer is live the moment the MCP server boots.
+The peer is live the moment the shim probes the daemon and resolves identity (a few hundred ms after Desktop launch).
 
 ## Tool surface
 
@@ -87,6 +103,7 @@ The peer is live the moment the MCP server boots.
 | `synapse_peers` / `synapse_whoami` | Identity introspection. Self-bootstrap on first call. |
 | `synapse_audit` | Provenance log — debug cross-peer messaging, identify thread fragmentation, audit message routing. |
 | `synapse_cleanup` / `synapse_diag` | Zombie reaping + read-only health dump. |
+| `synapse_request_restart` | Exit this synapse MCP process so the host respawns it with fresh code. Mainly for Claude Desktop, which has no in-app `/mcp` reconnect. |
 
 `synapse_register` is **deprecated and disabled**. Identity is assigned by SessionStart hook adoption or server-startup self-bootstrap. If you think you need to call it, run `synapse_diag` instead.
 

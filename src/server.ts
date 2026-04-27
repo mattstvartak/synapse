@@ -1132,6 +1132,46 @@ server.registerTool(
   },
 );
 
+// ── synapse_request_restart ───────────────────────────────────────
+// Claude Desktop has no in-app `/mcp reconnect` equivalent. Code can
+// kick the MCP server via the slash command; Desktop has to either
+// fully relaunch the app or have the running MCP server exit itself
+// so the Desktop host respawns it. This tool is the latter — call
+// from a Desktop session after a synapse upgrade to pick up new
+// code in dist/server.js without an app restart.
+//
+// Behavior: returns an "exiting" payload immediately, then exits the
+// node process ~150ms later so the response can flush over stdio. If
+// the MCP host (Desktop, Code) auto-respawns dead MCP servers, the
+// next tool call will hit a fresh process with new code loaded. If
+// the host doesn't auto-respawn, the session sees a transport drop
+// and the user has to manually trigger reconnect.
+
+server.registerTool(
+  'synapse_request_restart',
+  {
+    title: 'Request MCP Process Restart',
+    description: 'Exit this synapse MCP server process so the host (Claude Desktop / Claude Code) can respawn it with fresh code from disk. Use after upgrading synapse — Desktop has no in-app /mcp reconnect, so this is the only way to pick up code changes without relaunching the app. WARNING: any in-flight tool calls in this session will fail; the session will briefly see no synapse transport. Ask the user before calling.',
+    inputSchema: z.object({
+      reason: z.string().optional().describe('Optional human-readable reason, logged to stderr before exit.'),
+    }),
+  },
+  async ({ reason }) => {
+    const msg = reason ? `synapse_request_restart: ${reason}` : 'synapse_request_restart: caller-initiated exit';
+    process.stderr.write(`${msg}\n`);
+    // Schedule exit AFTER the response flushes. setTimeout + unref so
+    // the timer doesn't keep the process alive past its natural drain.
+    const t = setTimeout(() => process.exit(0), 150);
+    t.unref?.();
+    return json({
+      exiting: true,
+      pid: process.pid,
+      reason: reason ?? null,
+      note: 'MCP server will exit shortly. Host should respawn on next tool call (auto-respawn behavior is host-dependent).',
+    });
+  },
+);
+
   // Startup-time identity initialization. Best-effort — never throws.
   // Closes the whoami-null gap (synapse_whoami / synapse_peers used to
   // return null self until a tool that calls requireSelf() ran first).
