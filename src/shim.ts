@@ -188,7 +188,10 @@ export async function runShim(): Promise<void> {
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
+        // The MCP Streamable HTTP transport rejects requests that don't
+        // advertise BOTH content types in Accept, even when the server
+        // is configured to return plain JSON (enableJsonResponse=true).
+        'Accept': 'application/json, text/event-stream',
         'Authorization': `Bearer ${state.token}`,
         'X-Synapse-Label': label,
         'X-Synapse-Identity-Token': identity.identityToken,
