@@ -22,30 +22,41 @@ import {
 import { generateClientId } from './identity.js';
 import type {
   Peer, Message, Thread, AuditEntry,
+  SynapseConfig, IdentityPaths,
 } from './types.js';
 import {
   DEFAULT_AUTO_CAPS, buildIdentityPaths,
   isThreadAddress, threadIdFromAddress,
 } from './types.js';
 
-const config = loadConfig();
-const paths = buildIdentityPaths(config.dataDir);
+// Per-instance state and config injection. Stdio mode passes nothing
+// (everything self-derives from env). Daemon mode pre-populates selfId/
+// selfLabel/selfSessionId per HTTP connection and sets bootstrapEnabled
+// to false so requireSelf() refuses to mint a fresh identity.
+export interface SynapseSession {
+  selfId?: string | null;
+  selfLabel?: string | null;
+  selfSessionId?: string | null;
+  config?: SynapseConfig;
+  paths?: IdentityPaths;
+  ppid?: number;
+  bootstrapEnabled?: boolean;
+}
 
-// Session-scoped identity. Set by synapse_register, used implicitly elsewhere.
-let selfId: string | null = null;
-let selfLabel: string | null = null;
-// Session-keyed discriminator for state files. Captured from the active
-// file we adopt, or generated at bootstrap time if no hook ran. Used for
-// auto-state file writes so the PreToolUse hook can find them.
-let selfSessionId: string | null = null;
+export function createSynapseServer(initial: SynapseSession = {}): McpServer {
+  const config = initial.config ?? loadConfig();
+  const paths = initial.paths ?? buildIdentityPaths(config.dataDir);
+  const PPID = initial.ppid ?? process.ppid;
+  const bootstrapEnabled = initial.bootstrapEnabled ?? true;
 
-// PPID kept for legacy fallback only. v1.1 keyed every state file on
-// process.ppid assuming hook + MCP shared a Claude Code parent PID, but
-// on Windows native that assumption breaks (Claude Code spawns hook vs
-// MCP through different intermediate processes). v1.2 prefers the hook's
-// stdin-derived `session_id` and falls back to "freshest active file"
-// when neither side has direct access to it.
-const PPID = process.ppid;
+  // Session-scoped identity. Set by hook adoption or self-bootstrap in
+  // stdio mode; pre-set externally in daemon mode.
+  let selfId: string | null = initial.selfId ?? null;
+  let selfLabel: string | null = initial.selfLabel ?? null;
+  // Session-keyed discriminator for state files. Captured from the active
+  // file we adopt, or generated at bootstrap time if no hook ran. Used for
+  // auto-state file writes so the PreToolUse hook can find them.
+  let selfSessionId: string | null = initial.selfSessionId ?? null;
 
 // Session-keyed adoption order:
 // 1. CLAUDE_SESSION_ID env (cheapest, only if Claude Code exposes it).
@@ -278,6 +289,14 @@ function requireSelf(): string {
     }
   }
   if (!selfId) {
+    // Daemon mode opts out of self-bootstrap: peer ID must be assigned
+    // externally (by the daemon, per HTTP connection) before any tool
+    // call. Surfacing this as a hard error prevents the daemon from
+    // accidentally minting a server-wide identity that would collide
+    // with the per-connection identities.
+    if (!bootstrapEnabled) {
+      throw new Error('Synapse: peer identity not assigned. Daemon mode requires the caller to set selfId before any tool call.');
+    }
     // Self-bootstrap: no hook has written a session file yet (e.g. /mcp
     // reconnect happened without a fresh SessionStart, or the hook is
     // disabled). Generate our own ID and a synthetic session_id, then
@@ -1059,7 +1078,15 @@ server.registerTool(
   },
 );
 
-// ── Run ───────────────────────────────────────────────────────────
+  return server;
+}
 
+// ── Run as stdio MCP (default mode) ───────────────────────────────
+// Invoked when this module is the entrypoint, i.e. `synapse-mcp` with
+// no subcommand resolves to running this file directly. Daemon mode
+// (`synapse-mcp daemon`) imports createSynapseServer from this module
+// and wires it to an HTTP transport instead.
+
+const stdioServer = createSynapseServer();
 const transport = new StdioServerTransport();
-await server.connect(transport);
+await stdioServer.connect(transport);
