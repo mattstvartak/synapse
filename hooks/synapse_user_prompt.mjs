@@ -125,6 +125,21 @@ try {
   const now = new Date().toISOString();
   db.prepare(`UPDATE peers SET last_seen_at = ? WHERE id = ?`).run(now, selfId);
 
+  // §4.10 — mark this peer busy for the duration of the user turn so
+  // recruit-prospect selection deprioritizes us. Stop hook clears the
+  // row + appends an idle-event when the turn ends. Schema lives in
+  // peer_busy_state (added by Stage 8). busy_reason is free-form TEXT;
+  // hook convention is USER_DRIVEN for normal prompts. CRON_ONLY,
+  // EXPLICIT_BUSY, EXPLICIT_AWAY are reserved for tool-driven idle
+  // transitions (synapse_set_busy / synapse_set_idle).
+  db.prepare(`
+    INSERT INTO peer_busy_state (peer_id, busy_at, busy_reason, shim_fingerprint)
+    VALUES (?, ?, 'USER_DRIVEN', NULL)
+    ON CONFLICT(peer_id) DO UPDATE SET
+      busy_at     = excluded.busy_at,
+      busy_reason = excluded.busy_reason
+  `).run(selfId, now);
+
   const heartbeatCutoff = new Date(Date.now() - peerTimeoutSec * 1000).toISOString();
   const messages = db.prepare(`
     SELECT m.id, m.from_id AS fromId, m.to_id AS toId, m.thread_id AS threadId,
