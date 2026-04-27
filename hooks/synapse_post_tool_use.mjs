@@ -53,11 +53,14 @@ function emitNothing() {
   process.exit(0);
 }
 
+// SYNAPSE_LABEL env beats argv. Settings.json hardcodes one --label=<l>
+// across all Claude Code windows; per-window labels come from env.
 function parseLabel() {
+  if (process.env.SYNAPSE_LABEL) return process.env.SYNAPSE_LABEL;
   for (const arg of process.argv.slice(2)) {
     if (arg.startsWith('--label=')) return arg.slice('--label='.length);
   }
-  return process.env.SYNAPSE_LABEL;
+  return null;
 }
 
 // Stdin-derived session_id is the authoritative discriminator (mirrors the
@@ -151,7 +154,7 @@ try {
   // message from a peer who just went silent is still a real message
   // and shouldn't disappear from the unread count. This now matches
   // pollInbox semantics exactly.
-  const countRow = db.prepare(`
+  const inboundRow = db.prepare(`
     SELECT COUNT(*) AS n
     FROM messages
     WHERE (
@@ -169,48 +172,81 @@ try {
     AND expires_at >= ?
     AND read_at IS NULL
   `).get(selfId, selfId, selfId, selfId, now);
-  const total = Number(countRow?.n ?? 0);
+  const inboundCount = Number(inboundRow?.n ?? 0);
 
-  if (total === 0) {
+  // Outbound awaiting reply — messages I sent on a thread where no
+  // peer has replied since. Surfaces "you have an in-flight outbound,
+  // don't go idle" so wait_reply timeouts don't strand conversations.
+  // Real fix for human-paced peer drafting (cf. §3.1 in PR proposal).
+  const outboundRow = db.prepare(`
+    SELECT COUNT(*) AS n,
+           MIN(m.created_at) AS oldest
+    FROM messages m
+    WHERE m.from_id = ?
+      AND m.expires_at >= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM messages r
+        WHERE r.thread_id = m.thread_id
+          AND r.from_id != ?
+          AND r.created_at > m.created_at
+      )
+  `).get(selfId, now, selfId);
+  const outboundCount = Number(outboundRow?.n ?? 0);
+  const outboundOldest = outboundRow?.oldest ?? null;
+  const outboundOldestAgeSec = outboundOldest
+    ? Math.floor((Date.now() - new Date(outboundOldest).getTime()) / 1000)
+    : null;
+
+  if (inboundCount === 0 && outboundCount === 0) {
     db.close();
     emitNothing();
   }
 
   // Cheap second query for sender labels — only fired when we have
-  // something to surface. Capped at LIMIT 5 since labels are display
+  // inbound to surface. Capped at LIMIT 5 since labels are display
   // hints, not the authoritative count.
-  const labelRows = db.prepare(`
-    SELECT DISTINCT COALESCE(p.label, m.from_id) AS senderLabel
-    FROM messages m
-    LEFT JOIN peers p ON p.id = m.from_id
-    WHERE (
-      m.to_id = ?
-      OR (m.to_id = 'broadcast' AND m.from_id != ?)
-      OR (
-        m.to_id LIKE 'thread:%'
-        AND m.from_id != ?
-        AND EXISTS (
-          SELECT 1 FROM thread_participants tp
-          WHERE tp.thread_id = m.thread_id AND tp.peer_id = ?
+  let senderLabels = [];
+  if (inboundCount > 0) {
+    const labelRows = db.prepare(`
+      SELECT DISTINCT COALESCE(p.label, m.from_id) AS senderLabel
+      FROM messages m
+      LEFT JOIN peers p ON p.id = m.from_id
+      WHERE (
+        m.to_id = ?
+        OR (m.to_id = 'broadcast' AND m.from_id != ?)
+        OR (
+          m.to_id LIKE 'thread:%'
+          AND m.from_id != ?
+          AND EXISTS (
+            SELECT 1 FROM thread_participants tp
+            WHERE tp.thread_id = m.thread_id AND tp.peer_id = ?
+          )
         )
       )
-    )
-    AND m.expires_at >= ?
-    AND m.read_at IS NULL
-    LIMIT 5
-  `).all(selfId, selfId, selfId, selfId, now);
+      AND m.expires_at >= ?
+      AND m.read_at IS NULL
+      LIMIT 5
+    `).all(selfId, selfId, selfId, selfId, now);
+    senderLabels = labelRows.map(r => r.senderLabel).filter(Boolean);
+  }
 
   db.close();
 
-  const senderLabels = labelRows
-    .map(r => r.senderLabel)
-    .filter(Boolean);
-  const labelsAttr = senderLabels.length
-    ? ` labels="${senderLabels.join(', ').replace(/"/g, '&quot;')}"`
-    : '';
-  const marker = `<peer_input_pending count="${total}"${labelsAttr}/>`;
+  const markers = [];
+  if (inboundCount > 0) {
+    const labelsAttr = senderLabels.length
+      ? ` labels="${senderLabels.join(', ').replace(/"/g, '&quot;')}"`
+      : '';
+    markers.push(`<peer_input_pending count="${inboundCount}"${labelsAttr}/>`);
+  }
+  if (outboundCount > 0) {
+    const ageAttr = outboundOldestAgeSec !== null
+      ? ` oldest_age_sec="${outboundOldestAgeSec}"`
+      : '';
+    markers.push(`<outbound_awaiting_reply count="${outboundCount}"${ageAttr}/>`);
+  }
 
-  emitContext(marker);
+  emitContext(markers.join(''));
 } catch (err) {
   process.stderr.write(`synapse post-tool-use hook: ${err && err.stack ? err.stack : err}\n`);
   emitNothing();

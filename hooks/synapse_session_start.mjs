@@ -40,14 +40,18 @@ import {
 import { INIT_SCHEMA_SQL } from '../dist/schema.js';
 import { loadConfig } from '../dist/config.js';
 
-// --label=<l> argv beats SYNAPSE_LABEL env. Direct-node hook invocations
-// (no `bash -c` wrapper) preserve process.ppid as a Claude Code child,
-// which we still record for legacy MCP fallback lookup.
+// SYNAPSE_LABEL env beats --label=<l> argv. Settings.json hardcodes a
+// single argv (e.g. --label=code) shared across every Claude Code window;
+// per-window labels (cowork/desktop/etc.) come from the environment, so
+// env must take priority. Argv is the fallback default. Direct-node hook
+// invocations preserve process.ppid as a Claude Code child for legacy
+// MCP fallback lookup.
 function parseLabel() {
+  if (process.env.SYNAPSE_LABEL) return process.env.SYNAPSE_LABEL;
   for (const arg of process.argv.slice(2)) {
     if (arg.startsWith('--label=')) return arg.slice('--label='.length);
   }
-  return process.env.SYNAPSE_LABEL;
+  return null;
 }
 
 // Best-effort stdin parse. Claude Code passes a JSON payload like

@@ -58,11 +58,14 @@ async function readStdin() {
   });
 }
 
+// SYNAPSE_LABEL env beats argv. Settings.json hardcodes one --label=<l>
+// across all Claude Code windows; per-window labels come from env.
 function parseLabel() {
+  if (process.env.SYNAPSE_LABEL) return process.env.SYNAPSE_LABEL;
   for (const arg of process.argv.slice(2)) {
     if (arg.startsWith('--label=')) return arg.slice('--label='.length);
   }
-  return process.env.SYNAPSE_LABEL;
+  return null;
 }
 
 // v1.2 session_id keying for the auto-state file. The MCP server writes

@@ -39,11 +39,14 @@ function approve(extra = {}) {
   process.exit(0);
 }
 
+// SYNAPSE_LABEL env beats argv. Settings.json hardcodes one --label=<l>
+// across all Claude Code windows; per-window labels come from env.
 function parseLabel() {
+  if (process.env.SYNAPSE_LABEL) return process.env.SYNAPSE_LABEL;
   for (const arg of process.argv.slice(2)) {
     if (arg.startsWith('--label=')) return arg.slice('--label='.length);
   }
-  return process.env.SYNAPSE_LABEL;
+  return null;
 }
 
 // Stdin-derived session_id matches the SessionStart hook + MCP server's v1.2

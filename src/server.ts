@@ -17,6 +17,8 @@ import {
   listActiveFiles, classifyActiveFile, deleteActiveFile,
   findActiveFileDuplicates,
   dropPeersExcept,
+  findRecentSharedThread,
+  countOutboundAwaitingReply,
   type ActiveFileInfo,
 } from './storage.js';
 import { generateClientId } from './identity.js';
@@ -276,18 +278,65 @@ function checkAndCountAuto(
   return { allowed: true, reason: null, thread };
 }
 
-function requireSelf(): string {
-  if (!selfId) {
-    // First preference: adopt the ID written by SessionStart for this window.
-    const adopted = tryAdoptFromHook();
-    if (adopted) {
-      selfId = adopted.id;
-      selfLabel = adopted.label;
-      selfSessionId = adopted.sessionId;
-      touchPeer(config, selfId);
-      stampMcpPidIntoActiveFile(adopted.label, adopted.sessionId);
-    }
+// Adopt identity written by SessionStart hook (or a prior MCP run on
+// this session). Sets selfId/selfLabel/selfSessionId and touches the
+// peer row + stamps mcpPid into the active file. Returns true on
+// success, false if no fresh active file was found.
+function tryAdoptIntoSelf(): boolean {
+  const adopted = tryAdoptFromHook();
+  if (!adopted) return false;
+  selfId = adopted.id;
+  selfLabel = adopted.label;
+  selfSessionId = adopted.sessionId;
+  touchPeer(config, selfId);
+  stampMcpPidIntoActiveFile(adopted.label, adopted.sessionId);
+  return true;
+}
+
+// Mint a fresh peer ID + sessionId from SYNAPSE_LABEL and persist them.
+// Throws if the env is unset. Used by requireSelf when no hook adoption
+// happened, and by the startup auto-register path.
+function selfBootstrap(): void {
+  const label = process.env.SYNAPSE_LABEL;
+  if (!label) {
+    throw new Error('Synapse: SYNAPSE_LABEL not set; cannot self-bootstrap. Set SYNAPSE_LABEL in the MCP config env, or rely on the SessionStart hook to write an active file before the first tool call.');
   }
+  const id = generateClientId(label);
+  const now = new Date().toISOString();
+  const sessionId = process.env.CLAUDE_SESSION_ID ?? randomUUID();
+  upsertPeer(config, {
+    id, label,
+    registeredAt: now, lastSeenAt: now,
+    capabilities: null,
+  });
+  const payload = JSON.stringify({
+    id, label, registeredAt: now,
+    sessionId, ppid: PPID,
+    mcpPid: process.pid,
+    source: 'mcp-bootstrap',
+  }, null, 2);
+  try { writeFileSync(paths.active(label, sessionId), payload, 'utf-8'); }
+  catch { /* best-effort */ }
+  selfId = id;
+  selfLabel = label;
+  selfSessionId = sessionId;
+}
+
+// Best-effort identity initialization. Tries hook adoption first; if
+// no active file exists and bootstrap is enabled and SYNAPSE_LABEL is
+// set, mints a fresh identity. Never throws — designed for startup
+// where missing env should be a quiet no-op (introspection tools will
+// see selfId=null and the caller can run synapse_diag).
+function tryAdoptOrBootstrap(): boolean {
+  if (selfId) return true;
+  if (tryAdoptIntoSelf()) return true;
+  if (!bootstrapEnabled) return false;
+  try { selfBootstrap(); return true; }
+  catch { return false; }
+}
+
+function requireSelf(): string {
+  if (!selfId) tryAdoptIntoSelf();
   if (!selfId) {
     // Daemon mode opts out of self-bootstrap: peer ID must be assigned
     // externally (by the daemon, per HTTP connection) before any tool
@@ -297,37 +346,9 @@ function requireSelf(): string {
     if (!bootstrapEnabled) {
       throw new Error('Synapse: peer identity not assigned. Daemon mode requires the caller to set selfId before any tool call.');
     }
-    // Self-bootstrap: no hook has written a session file yet (e.g. /mcp
-    // reconnect happened without a fresh SessionStart, or the hook is
-    // disabled). Generate our own ID and a synthetic session_id, then
-    // write the session-keyed active file so any subsequent hook on
-    // this Claude Code session can find us. v1.3+: no ppid-keyed
-    // duplicate — sessionId is the only discriminator.
-    const label = process.env.SYNAPSE_LABEL;
-    if (!label) {
-      throw new Error('Not registered. Call synapse_register first or set SYNAPSE_LABEL.');
-    }
-    const id = generateClientId(label);
-    const now = new Date().toISOString();
-    const sessionId = process.env.CLAUDE_SESSION_ID ?? randomUUID();
-    upsertPeer(config, {
-      id, label,
-      registeredAt: now, lastSeenAt: now,
-      capabilities: null,
-    });
-    const payload = JSON.stringify({
-      id, label, registeredAt: now,
-      sessionId, ppid: PPID,
-      mcpPid: process.pid,
-      source: 'mcp-bootstrap',
-    }, null, 2);
-    try { writeFileSync(paths.active(label, sessionId), payload, 'utf-8'); }
-    catch { /* best-effort */ }
-    selfId = id;
-    selfLabel = label;
-    selfSessionId = sessionId;
+    selfBootstrap();
   }
-  return selfId;
+  return selfId!;
 }
 
 const server = new McpServer(
@@ -362,7 +383,6 @@ const server = new McpServer(
       'When the user wants several Code/Cowork sessions split across separate concurrent tasks, route on threads. Each working group has a thread; participants join via synapse_join_thread or implicitly by sending/replying on thread:<id>. Inbox surfaces thread:<id> messages only to participants — no cross-talk between groups.',
       '',
       '## Tools',
-      '- synapse_register({ label }) — usually unneeded; the hook auto-registers and the server adopts the same identity.',
       '- synapse_send({ to, body, threadId? }) — `to` = peerId | "broadcast" | "thread:<threadId>".',
       '- synapse_poll() — returns unread (auto-filtered by thread participation).',
       '- synapse_ack({ messageId }) — mark read after the user has seen it.',
@@ -387,39 +407,29 @@ const server = new McpServer(
   },
 );
 
-// ── synapse_register ──────────────────────────────────────────────
+// ── synapse_register_DEPRECATED ───────────────────────────────────
+// Renamed from synapse_register so the deprecation is visible at the
+// call site without reading the description. Handler hard-errors —
+// auto-registration via SessionStart hook + server self-bootstrap is
+// the only sanctioned identity path. Manual register would create a
+// peer row with a NEW id without updating the active file or the
+// MCP's sessionId, causing the post-tool-use hook and the MCP to
+// disagree on selfId for the rest of the session.
 
 server.registerTool(
-  'synapse_register',
+  'synapse_register_DEPRECATED',
   {
-    title: 'Register Client (DEPRECATED)',
-    description: 'DEPRECATED — do not call. The SessionStart hook auto-registers each session with the right identity, and the MCP server adopts that identity on first tool call (or self-bootstraps if the hook is unavailable). Calling synapse_register manually creates a peer row with a NEW id but does NOT update the active file or set the MCP\'s sessionId, causing the post-tool-use hook and the MCP to disagree on selfId for the rest of the session. Will be removed in a future release.',
+    title: 'Register Client (DEPRECATED — DO NOT CALL)',
+    description: 'DEPRECATED. Calling this tool is a no-op that throws. The SessionStart hook auto-registers each session and the MCP server adopts that identity (or self-bootstraps from SYNAPSE_LABEL on startup). If you think you need to call this, you do not.',
     inputSchema: z.object({
-      label: z.string().describe('Human-friendly label (e.g. "code", "desktop", "ipad-code"). A short suffix is appended for uniqueness.'),
-      capabilities: z.array(z.string()).optional().describe('Optional capability tags (e.g. "filesystem", "browser", "git").'),
+      label: z.string().optional(),
+      capabilities: z.array(z.string()).optional(),
     }),
   },
-  async ({ label, capabilities }) => {
-    const id = generateClientId(label);
-    const now = new Date().toISOString();
-    const peer: Peer = {
-      id,
-      label,
-      registeredAt: now,
-      lastSeenAt: now,
-      capabilities: capabilities && capabilities.length > 0 ? JSON.stringify(capabilities) : null,
-    };
-    upsertPeer(config, peer);
-    pruneStalePeers(config);
-    pruneExpired(config);
-    selfId = id;
-    selfLabel = label;
-    return json({
-      id,
-      label,
-      registeredAt: now,
-      warning: 'synapse_register is deprecated; see tool description.',
-    });
+  async () => {
+    throw new Error(
+      'synapse_register is deprecated and disabled. Identity is assigned by the SessionStart hook (Claude Code) or by server startup self-bootstrap (set SYNAPSE_LABEL in MCP config). If self is missing, run synapse_diag to inspect adoption state.',
+    );
   },
 );
 
@@ -429,7 +439,7 @@ server.registerTool(
   'synapse_send',
   {
     title: 'Send Message',
-    description: 'Send a message to a peer ID or "broadcast". Returns messageId and threadId.',
+    description: 'Send a message to a peer ID or "broadcast". Returns messageId, threadId, and a `suggestedNext` hint pointing at synapse_wait_reply — chain into it to receive the reply without going idle.',
     inputSchema: z.object({
       to: z.string().describe('Target peer ID (from synapse_peers) or "broadcast".'),
       body: z.string().describe('Message body (markdown ok).'),
@@ -441,6 +451,24 @@ server.registerTool(
   async ({ to, body, threadId, workspace, ttlSeconds }) => {
     const from = requireSelf();
     touchPeer(config, from);
+
+    // Thread-fragmentation guard. When the caller addresses a peer
+    // directly (not "broadcast", not "thread:<id>") and provides no
+    // threadId, AND there's already a recent shared thread between
+    // self and that peer, refuse to mint a new one — that's almost
+    // always an accidental fragmentation (lived through it during
+    // the proposal-doc session). Caller can opt out by passing the
+    // shared threadId explicitly, or use synapse_reply.
+    if (!threadId && to !== 'broadcast' && !isThreadAddress(to)) {
+      const sharedThread = findRecentSharedThread(config, from, to);
+      if (sharedThread) {
+        throw new Error(
+          `Refusing to mint a new thread: an active thread (${sharedThread}) already exists between ${from} and ${to}. ` +
+          `Use synapse_reply({ messageId }) to continue the conversation, or pass threadId="${sharedThread}" explicitly to synapse_send. ` +
+          `Pass threadId=<new uuid> to deliberately start a separate thread.`,
+        );
+      }
+    }
 
     // Address-driven threadId: when the address is `thread:<id>` and no
     // explicit threadId was provided, the addressed thread IS the thread.
@@ -489,7 +517,12 @@ server.registerTool(
     joinThread(config, tid, from);
 
     recordAudit('synapse_send', from, tid, { to, messageId: id }, 'allowed');
-    return json({ messageId: id, threadId: tid, expiresAt });
+    return json({
+      messageId: id,
+      threadId: tid,
+      expiresAt,
+      suggestedNext: { tool: 'synapse_wait_reply', messageId: id },
+    });
   },
 );
 
@@ -499,7 +532,7 @@ server.registerTool(
   'synapse_poll',
   {
     title: 'Poll Inbox',
-    description: 'Returns messages where to == self OR (to == "broadcast" AND from != self). Auto-touches peer heartbeat.',
+    description: 'Returns messages where to == self OR (to == "broadcast" AND from != self). Auto-touches peer heartbeat. Response includes `serverHealth` with the server\'s pid and current timestamp — clients comparing this across calls can detect MCP transport health.',
     inputSchema: z.object({
       since: z.string().optional().describe('ISO timestamp; only messages after this. Default: returns all unread.'),
       unreadOnly: z.boolean().optional().describe('Default true. Set false to include already-read messages within TTL.'),
@@ -514,7 +547,14 @@ server.registerTool(
       unreadOnly: unreadOnly !== false,
       workspace,
     });
-    return json({ count: messages.length, messages });
+    return json({
+      count: messages.length,
+      messages,
+      serverHealth: {
+        mcpPid: process.pid,
+        respondedAt: new Date().toISOString(),
+      },
+    });
   },
 );
 
@@ -541,7 +581,7 @@ server.registerTool(
   'synapse_reply',
   {
     title: 'Reply on Thread',
-    description: 'Reply to a message. Auto-routes to the original sender on the same thread.',
+    description: 'Reply to a message. Auto-routes to the original sender on the same thread. Returns a `suggestedNext` hint pointing at synapse_wait_reply — chain into it to receive the next reply without going idle.',
     inputSchema: z.object({
       messageId: z.string().describe('Message to reply to.'),
       body: z.string(),
@@ -579,7 +619,12 @@ server.registerTool(
     insertMessage(config, reply);
     joinThread(config, parent.threadId, self);
     recordAudit('synapse_reply', self, parent.threadId, { parentId: parent.id, messageId: id }, 'allowed');
-    return json({ messageId: id, threadId: parent.threadId, expiresAt });
+    return json({
+      messageId: id,
+      threadId: parent.threadId,
+      expiresAt,
+      suggestedNext: { tool: 'synapse_wait_reply', messageId: id },
+    });
   },
 );
 
@@ -610,6 +655,11 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
+    // Defensive adoption — startup bootstrap is the primary path, but
+    // a Claude Code session whose SessionStart hook hasn't fired yet
+    // (rare, but observed on /mcp reconnect) needs this fallback so
+    // peers tool doesn't return self=null on first call.
+    tryAdoptOrBootstrap();
     const all = listActivePeers(config);
     const peers = all
       .filter(p => p.id !== selfId)
@@ -635,7 +685,11 @@ server.registerTool(
     description: 'Returns this session\'s peer ID and label.',
     inputSchema: z.object({}),
   },
-  async () => json({ id: selfId, label: selfLabel }),
+  async () => {
+    // Defensive adoption — see synapse_peers comment.
+    tryAdoptOrBootstrap();
+    return json({ id: selfId, label: selfLabel });
+  },
 );
 
 // ── synapse_wait_reply ────────────────────────────────────────────
@@ -1077,6 +1131,34 @@ server.registerTool(
     });
   },
 );
+
+  // Startup-time identity initialization. Best-effort — never throws.
+  // Closes the whoami-null gap (synapse_whoami / synapse_peers used to
+  // return null self until a tool that calls requireSelf() ran first).
+  // Also gives Claude Desktop auto-register parity without needing a
+  // desktop-side SessionStart hook: as long as SYNAPSE_LABEL is in the
+  // MCP config env, the peer is live the moment the server boots.
+  tryAdoptOrBootstrap();
+
+  // Heartbeat — touch self peer row + active-file mtime periodically
+  // while the server is alive. Lets the UserPromptSubmit hook detect
+  // "MCP transport is down" by checking peer last_seen_at staleness:
+  // if mcpPid is stamped on disk but last_seen_at is older than ~2x
+  // this interval, the MCP process is gone and the hook should warn
+  // the user before claiming "no new messages." (§1.5 a+c.)
+  if (bootstrapEnabled) {
+    const HEARTBEAT_INTERVAL_MS = 30_000;
+    const timer = setInterval(() => {
+      if (!selfId) return;
+      try { touchPeer(config, selfId); }
+      catch { /* best-effort */ }
+      if (selfLabel && selfSessionId) {
+        try { stampMcpPidIntoActiveFile(selfLabel, selfSessionId); }
+        catch { /* best-effort */ }
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+    timer.unref?.();
+  }
 
   return server;
 }

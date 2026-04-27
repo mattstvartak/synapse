@@ -405,6 +405,67 @@ export function listMyThreads(
   return (rows as Array<{ threadId: string }>).map(r => r.threadId);
 }
 
+// Return the most recent thread (by latest non-expired message) where
+// both peers are participants. Used by synapse_send to detect when a
+// caller is about to silently fragment an active conversation by
+// omitting threadId — see §1.2 in the PR-readiness proposal.
+export function findRecentSharedThread(
+  config: SynapseConfig,
+  peerA: string,
+  peerB: string,
+): string | null {
+  const row = getDb(config).prepare(`
+    SELECT m.thread_id AS threadId
+    FROM messages m
+    WHERE m.expires_at >= ?
+      AND m.thread_id IN (
+        SELECT thread_id FROM thread_participants WHERE peer_id = ?
+        INTERSECT
+        SELECT thread_id FROM thread_participants WHERE peer_id = ?
+      )
+    ORDER BY m.created_at DESC
+    LIMIT 1
+  `).get(new Date().toISOString(), peerA, peerB);
+  return row ? (row as { threadId: string }).threadId : null;
+}
+
+// Count outbound messages from selfId that have NOT received a reply
+// (i.e. no message exists with parent_id pointing at any of self's sent
+// messages on the same thread). Returns the count and oldest_age in
+// seconds. Used by hooks to surface "you have unreplied outbound" so
+// agents don't go idle waiting on a peer that's still drafting.
+export interface OutboundAwaitingReply {
+  count: number;
+  oldestAgeSec: number | null;
+}
+
+export function countOutboundAwaitingReply(
+  config: SynapseConfig,
+  selfId: string,
+): OutboundAwaitingReply {
+  const now = new Date().toISOString();
+  const row = getDb(config).prepare(`
+    SELECT COUNT(*) AS n,
+           MIN(m.created_at) AS oldest
+    FROM messages m
+    WHERE m.from_id = ?
+      AND m.expires_at >= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM messages r
+        WHERE r.thread_id = m.thread_id
+          AND r.from_id != ?
+          AND r.created_at > m.created_at
+      )
+  `).get(selfId, now, selfId);
+  if (!row) return { count: 0, oldestAgeSec: null };
+  const count = Number((row as { n: number }).n ?? 0);
+  const oldest = (row as { oldest: string | null }).oldest;
+  const oldestAgeSec = oldest
+    ? Math.floor((Date.now() - new Date(oldest).getTime()) / 1000)
+    : null;
+  return { count, oldestAgeSec };
+}
+
 // ── Active-file scan + staleness ───────────────────────────────────
 // Source-of-truth predicates for the synapse_cleanup tool, the
 // SessionStart hook GC, and any future tooling that has to reason
