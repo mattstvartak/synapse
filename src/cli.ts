@@ -13,6 +13,8 @@ const HELP = `synapse-mcp — cross-client bridge
 
 Usage:
   synapse-mcp                                              run MCP stdio server
+  synapse-mcp daemon                                       run as long-lived HTTP daemon (multi-client)
+  synapse-mcp shim                                         run as stdio→HTTP shim (connects to daemon)
   synapse-mcp audit-log <toolName> <result> [reason]       record a hook-side audit entry
   synapse-mcp help                                         this message
 
@@ -27,9 +29,11 @@ audit-log:
 
 Environment:
   SYNAPSE_DATA_DIR              data directory (default ~/.claude/synapse)
-  SYNAPSE_LABEL                 client label (required for audit-log subcommand)
+  SYNAPSE_LABEL                 client label (required for audit-log + shim)
   SYNAPSE_TTL_SECONDS           default message TTL (default 86400 = 24h)
   SYNAPSE_PEER_TIMEOUT_SECONDS  peer heartbeat window (default 600 = 10 min)
+  SYNAPSE_DAEMON_PORT           daemon listen port (default 8765)
+  SYNAPSE_DAEMON_URL            shim target URL (default http://127.0.0.1:8765)
 `;
 
 // Returns the absolute path of the most-recently modified file in `dir`
@@ -173,6 +177,16 @@ async function main(): Promise<void> {
     case 'audit-log':
       runAuditLog(rest);
       return;
+    case 'daemon': {
+      const { runDaemon } = await import('./daemon.js');
+      await runDaemon();
+      return;
+    }
+    case 'shim': {
+      const { runShim } = await import('./shim.js');
+      await runShim();
+      return;
+    }
     default:
       process.stderr.write(`synapse-mcp: unknown subcommand "${sub}"\n\n${HELP}`);
       process.exit(2);
