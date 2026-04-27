@@ -129,6 +129,28 @@ async function ensureDaemon(): Promise<DaemonState> {
   return spawnDaemon();
 }
 
+// Write a minimal active-<label>-<sessionId>.json so the existing
+// SessionStart / PostToolUse hooks can still resolve selfId in
+// daemon-mode sessions. The hooks read these files to count unread
+// messages and emit `<peer_input_pending>` markers; without one they
+// silently report no peers. The daemon is the source of truth, but
+// hooks haven't been migrated to query it yet.
+function writeShimActiveFile(label: string, peerId: string, identityToken: string): void {
+  const sessionId = identityToken; // identityToken doubles as the session discriminator for the hook
+  const path = join(dataDir(), `active-${label}-${sessionId}.json`);
+  mkdirSync(dataDir(), { recursive: true });
+  const payload = {
+    id: peerId,
+    label,
+    sessionId,
+    registeredAt: new Date().toISOString(),
+    ppid: process.ppid,
+    mcpPid: process.pid,
+    source: 'shim',
+  };
+  writeFileSync(path, JSON.stringify(payload, null, 2), 'utf-8');
+}
+
 async function negotiateIdentity(
   state: DaemonState,
   label: string,
@@ -171,7 +193,10 @@ export async function runShim(): Promise<void> {
   const identity = readIdentity(label);
   // Confirm identity with daemon before forwarding any frames so the very
   // first MCP call already has a stable peer ID.
-  await negotiateIdentity(state, label, identity);
+  const negotiated = await negotiateIdentity(state, label, identity);
+  if (negotiated.peerId) {
+    writeShimActiveFile(label, negotiated.peerId, negotiated.identityToken);
+  }
 
   const url = (process.env.SYNAPSE_DAEMON_URL ?? `http://127.0.0.1:${state.port}`).replace(/\/$/, '');
   let mcpSessionId: string | null = null;
