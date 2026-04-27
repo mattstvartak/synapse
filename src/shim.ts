@@ -151,6 +151,12 @@ function writeShimActiveFile(label: string, peerId: string, identityToken: strin
   writeFileSync(path, JSON.stringify(payload, null, 2), 'utf-8');
 }
 
+// §1.11 — sessionFingerprint identifies THIS shim process so the daemon
+// can refuse a second bind from a different shim trying to claim the
+// same identity-token. Minted once per shim startup; stable across
+// reconnects within the same shim, distinct between separate shims.
+const SHIM_SESSION_FINGERPRINT = randomUUID();
+
 async function negotiateIdentity(
   state: DaemonState,
   label: string,
@@ -163,8 +169,23 @@ async function negotiateIdentity(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${state.token}`,
     },
-    body: JSON.stringify({ label, identityToken: identity.identityToken }),
+    body: JSON.stringify({
+      label,
+      identityToken: identity.identityToken,
+      sessionFingerprint: SHIM_SESSION_FINGERPRINT,
+    }),
   });
+  if (res.status === 409) {
+    // §1.11 — a different shim is actively holding this identity-token.
+    // Surface the daemon's detail so the user can act (delete identity
+    // file for fresh shim, or wait for eviction). Hard exit so Claude
+    // doesn't keep retrying with the same token.
+    let detail = '';
+    try { detail = JSON.stringify(await res.json()); } catch { /* nope */ }
+    throw new Error(
+      `synapse-shim: identity contention. The daemon refused this shim's bind because another active shim is using the same identity-token. ${detail}`,
+    );
+  }
   if (!res.ok) {
     throw new Error(`synapse-shim: /identity returned ${res.status} ${res.statusText}`);
   }
@@ -220,6 +241,10 @@ export async function runShim(): Promise<void> {
         'Authorization': `Bearer ${state.token}`,
         'X-Synapse-Label': label,
         'X-Synapse-Identity-Token': identity.identityToken,
+        // §1.11 — sessionFingerprint locks token-to-shim binding for the
+        // life of the shim, blocking a different shim from claiming the
+        // same identity-token while this one is still alive.
+        'X-Synapse-Session-Fingerprint': SHIM_SESSION_FINGERPRINT,
       };
       if (mcpSessionId) headers['Mcp-Session-Id'] = mcpSessionId;
 

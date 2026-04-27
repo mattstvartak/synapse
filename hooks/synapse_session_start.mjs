@@ -121,7 +121,15 @@ async function resolveIdentityViaDaemon(dataDir, label) {
         'Authorization': `Bearer ${state.token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ label, identityToken: identity.identityToken }),
+      body: JSON.stringify({
+        label,
+        identityToken: identity.identityToken,
+        // §1.11 — hook-side fingerprint distinguishes "session-start
+        // hook called the daemon for this shim" from "another shim is
+        // claiming the same identity-token." Stable across hook calls
+        // within one Claude Code session via PPID + sessionId.
+        sessionFingerprint: `hook-${PPID}-${sessionId}`,
+      }),
       signal: AbortSignal.timeout(250),
     });
   } catch {

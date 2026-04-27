@@ -446,7 +446,7 @@ const server = new McpServer(
       '- synapse_open_auto({ threadId, goal, maxTurns?, maxWallClockSec?, maxTokensPerSide? }) — autonomous mode for this side.',
       '- synapse_pause({ threadId }) — kill switch.',
       '- synapse_wait_reply({ messageId, timeoutSec?, pollIntervalSec? }) — server-side long-poll for a thread reply.',
-      '- synapse_audit({ threadId?, callerId?, limit? }) — provenance log.',
+      '- synapse_audit({ threadId?, callerId?, limit?, format? }) — debugging + observability surface. Default returns audit log entries (filter by thread/caller) — use for "messages addressed to peer X never arrived" debugging, cross-peer routing investigation, thread-fragmentation forensics. Set format="counters" for §7 in-memory metrics (bootstrap, heartbeat, identityBindings, send/poll/wait_reply rates) — use for runtime health checks and success-criteria measurement.',
       '- synapse_cleanup({ dryRun?, purgeAll?, label? }) — reap zombie active-*.json + silent peer rows. The calling session is always kept.',
       '- synapse_diag() — read-only health dump: self, ppid map, active files, claude env vars. Use when identity adoption looks wrong.',
       '',

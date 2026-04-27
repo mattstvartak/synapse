@@ -80,7 +80,22 @@ interface IdentityBinding {
   // lastUsedAt is informational — supports future cleanup of long-stale
   // bindings (e.g. a label that hasn't reconnected in 30 days).
   lastUsedAt: string;
+  // §1.11 — sessionFingerprint distinguishes "same shim reconnecting"
+  // from "different shim claiming a token already in active use."
+  // Same fingerprint on a re-bind is a benign reconnect (shim crashed
+  // or /mcp reconnected); different fingerprint while the existing
+  // binding is fresh is a contention bug we want to refuse loudly.
+  // Optional for backward compat — bindings minted by pre-§1.11 daemon
+  // load with this unset; first new bind under that token records the
+  // fingerprint and locks the slot from then on.
+  sessionFingerprint?: string;
 }
+
+// §1.11 — staleness window for evicting a binding owned by a different
+// fingerprint. If the existing binding hasn't been refreshed in this
+// window, the old shim is presumed dead and the new fingerprint can
+// take over the slot without an error.
+const FINGERPRINT_EVICTION_MS = 10 * 60 * 1000; // 10 min
 
 const identityBindings = new Map<string, IdentityBinding>();
 let bindingsDataDir: string | null = null;
@@ -105,6 +120,9 @@ function loadIdentityBindings(dataDir: string): void {
         peerId: binding.peerId,
         label: binding.label,
         lastUsedAt: binding.lastUsedAt ?? new Date().toISOString(),
+        sessionFingerprint: typeof binding.sessionFingerprint === 'string'
+          ? binding.sessionFingerprint
+          : undefined,
       });
     }
     process.stderr.write(`synapse-daemon: identityBindings.loaded count=${identityBindings.size}\n`);
@@ -214,27 +232,80 @@ interface ResolvedIdentity {
   identityToken: string;
 }
 
-// Resolve <label, identityToken> to a peer ID. Reuses existing binding
-// if known; otherwise mints a new peer + persists the binding.
+// §1.11 — error class for HTTP layer to translate into 409 / clear
+// reason text. Distinguishable from generic Error via instanceof.
+class FingerprintConflictError extends Error {
+  constructor(
+    public readonly token: string,
+    public readonly existingFingerprint: string,
+    public readonly existingPeerId: string,
+    public readonly incomingFingerprint: string,
+  ) {
+    super(
+      `INVALID_SESSION_FINGERPRINT: token already actively bound to a different shim ` +
+      `(existing fingerprint ${existingFingerprint.slice(0, 8)}…, incoming ${incomingFingerprint.slice(0, 8)}…). ` +
+      `If you are the original shim, reuse the existing identity-token file. ` +
+      `If you are a fresh shim, mint a new identity-token (delete <label>-identity.json). ` +
+      `If the original is dead, wait ${Math.ceil(FINGERPRINT_EVICTION_MS / 60_000)} minutes for the binding to age out.`,
+    );
+    this.name = 'FingerprintConflictError';
+  }
+}
+
+// Resolve <label, identityToken, sessionFingerprint> to a peer ID. Reuses
+// existing binding if known and fingerprint matches; otherwise mints a
+// new peer + persists the binding.
+//
+// §1.11 fingerprint contention rules:
+//   - existing binding + same fingerprint → ALLOW (benign reconnect)
+//   - existing binding + different fingerprint + lastUsedAt < 10min → REJECT
+//   - existing binding + different fingerprint + lastUsedAt ≥ 10min → ALLOW (eviction)
+//   - existing binding + no fingerprint recorded (legacy) → ALLOW + adopt incoming fingerprint
+//   - no existing binding → mint, record fingerprint
 function resolveIdentity(
   label: string,
   identityToken: string | null,
   dataDir: string,
+  sessionFingerprint: string | null = null,
 ): ResolvedIdentity {
   const config = loadConfig({ dataDir });
 
   const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
 
   if (identityToken) {
     const existing = identityBindings.get(identityToken);
     if (existing && existing.label === label) {
+      // §1.11 fingerprint check.
+      if (sessionFingerprint && existing.sessionFingerprint) {
+        if (existing.sessionFingerprint !== sessionFingerprint) {
+          const lastUsedMs = new Date(existing.lastUsedAt).getTime();
+          const ageMs = nowMs - lastUsedMs;
+          if (ageMs < FINGERPRINT_EVICTION_MS) {
+            // Different fingerprint, binding still fresh — refuse.
+            bumpCounter('identityBindings.fingerprint_rejects');
+            throw new FingerprintConflictError(
+              identityToken,
+              existing.sessionFingerprint,
+              existing.peerId,
+              sessionFingerprint,
+            );
+          }
+          // Different fingerprint AND binding stale — eviction path.
+          bumpCounter('identityBindings.fingerprint_evictions');
+          existing.sessionFingerprint = sessionFingerprint;
+        }
+      } else if (sessionFingerprint && !existing.sessionFingerprint) {
+        // Legacy binding (pre-§1.11 daemon write) gets stamped with the
+        // first incoming fingerprint. From then on it's locked.
+        existing.sessionFingerprint = sessionFingerprint;
+      }
+
       // Refresh peer row's last_seen so cleanup doesn't reap a sticky-but-quiet client.
       const peer = getPeer(config, existing.peerId);
       if (peer) {
         touchPeer(config, existing.peerId);
       } else {
-        // Peer row got cleaned up since the binding was made. Re-insert with
-        // the same id so identity stays sticky across cleanup events.
         upsertPeer(config, {
           id: existing.peerId,
           label,
@@ -243,8 +314,6 @@ function resolveIdentity(
           capabilities: null,
         });
       }
-      // Touch lastUsedAt + persist so a long-quiet binding stays fresh on
-      // disk and future cleanup heuristics don't reap it.
       existing.lastUsedAt = nowIso;
       persistIdentityBindings();
       return { peerId: existing.peerId, label, identityToken };
@@ -261,7 +330,12 @@ function resolveIdentity(
     capabilities: null,
   });
   const token = identityToken ?? randomUUID();
-  identityBindings.set(token, { peerId, label, lastUsedAt: nowIso });
+  identityBindings.set(token, {
+    peerId,
+    label,
+    lastUsedAt: nowIso,
+    sessionFingerprint: sessionFingerprint ?? undefined,
+  });
   persistIdentityBindings();
   return { peerId, label, identityToken: token };
 }
@@ -315,12 +389,22 @@ async function handleMcp(
   // synapse server with the resolved identity pre-loaded.
   const label = (req.headers['x-synapse-label'] as string | undefined)?.trim();
   const identityToken = (req.headers['x-synapse-identity-token'] as string | undefined)?.trim() ?? null;
+  const sessionFingerprint = (req.headers['x-synapse-session-fingerprint'] as string | undefined)?.trim() ?? null;
   if (!label) {
     send(res, 400, { error: 'missing X-Synapse-Label header' });
     return;
   }
 
-  const identity = resolveIdentity(label, identityToken, dataDir);
+  let identity: ResolvedIdentity;
+  try {
+    identity = resolveIdentity(label, identityToken, dataDir, sessionFingerprint);
+  } catch (err) {
+    if (err instanceof FingerprintConflictError) {
+      send(res, 409, { error: 'INVALID_SESSION_FINGERPRINT', detail: err.message });
+      return;
+    }
+    throw err;
+  }
 
   // Build a per-connection SynapseSession. bootstrapEnabled is false:
   // daemon mode never self-mints inside the tool layer.
@@ -370,7 +454,7 @@ async function handleIdentity(
     send(res, 401, { error: 'unauthorized' });
     return;
   }
-  let body: { label?: string; identityToken?: string };
+  let body: { label?: string; identityToken?: string; sessionFingerprint?: string };
   try { body = (await readBody(req)) as typeof body ?? {}; }
   catch (err) {
     send(res, 400, { error: 'invalid json', detail: (err as Error).message });
@@ -381,7 +465,19 @@ async function handleIdentity(
     send(res, 400, { error: 'missing label' });
     return;
   }
-  const identity = resolveIdentity(label, body.identityToken ?? null, dataDir);
+  const sessionFingerprint = typeof body.sessionFingerprint === 'string'
+    ? body.sessionFingerprint.trim()
+    : null;
+  let identity: ResolvedIdentity;
+  try {
+    identity = resolveIdentity(label, body.identityToken ?? null, dataDir, sessionFingerprint);
+  } catch (err) {
+    if (err instanceof FingerprintConflictError) {
+      send(res, 409, { error: 'INVALID_SESSION_FINGERPRINT', detail: err.message });
+      return;
+    }
+    throw err;
+  }
   send(res, 200, {
     peerId: identity.peerId,
     identityToken: identity.identityToken,
