@@ -24,7 +24,13 @@ import {
   dropPeersExcept,
   findRecentSharedThread,
   countOutboundAwaitingReply,
+  setPeerBusy, clearPeerBusy, getPeerBusyState,
+  pruneStaleBusyState, clearAllPeerBusyState,
+  insertRecruit, findRecentRecruit, countRecentRecruits,
+  expireRecruits, fulfillRecruit, selectRecruitProspects,
   type ActiveFileInfo,
+  type BusyReason,
+  type RecruitRow, type RecruitUrgency,
 } from './storage.js';
 import { generateClientId } from './identity.js';
 import type {
@@ -1557,6 +1563,166 @@ server.registerTool(
       pid: process.pid,
       reason: reason ?? null,
       note: 'MCP server will exit shortly. Host should respawn on next tool call (auto-respawn behavior is host-dependent).',
+    });
+  },
+);
+
+// ── §4.10 synapse_set_busy ────────────────────────────────────────
+
+server.registerTool(
+  'synapse_set_busy',
+  {
+    title: 'Set Busy State',
+    description: 'Mark this peer as busy so it will not auto-join recruit broadcasts. Use when the user has assigned ongoing work that spans multiple turns and you do not want background recruitment to engage you. Combine with synapse_set_idle to clear. Auto-set/cleared by UserPromptSubmit + Stop hooks for normal user-driven turns; this tool is for explicit overrides. Reason is free-form text recorded for observability and may inform recruit-prospect sort priority.',
+    inputSchema: z.object({
+      reason: z.string().optional().describe('Optional reason tag (e.g. "USER_DRIVEN", "DRAFTING", "EXPLICIT_BUSY", "RECRUIT_ENGAGED", or a custom tag).'),
+    }),
+  },
+  async ({ reason }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    const tag: BusyReason = reason ?? 'EXPLICIT_BUSY';
+    setPeerBusy(config, self, tag);
+    bumpCounter('busy.set');
+    recordAudit('synapse_set_busy', self, null, { reason: tag }, 'allowed');
+    return json({ peerId: self, busyAt: new Date().toISOString(), reason: tag });
+  },
+);
+
+// ── §4.10 synapse_set_idle ────────────────────────────────────────
+
+server.registerTool(
+  'synapse_set_idle',
+  {
+    title: 'Set Idle State',
+    description: 'Mark this peer as idle so it will be visible to recruit broadcasts. The reason tag (e.g. "USER_DONE", "EXPLICIT_IDLE", "NEVER_BUSY", "CRON_ONLY") is recorded in the audit log; recruit-prospect sort consults the most recent idle audit entry per peer to prefer truly-just-finished sessions over background-cron-only ones.',
+    inputSchema: z.object({
+      reason: z.string().optional().describe('Optional reason tag identifying the idle context.'),
+    }),
+  },
+  async ({ reason }) => {
+    const self = requireSelf();
+    touchPeer(config, self);
+    const tag = reason ?? 'EXPLICIT_IDLE';
+    clearPeerBusy(config, self);
+    bumpCounter('busy.cleared');
+    recordAudit('synapse_set_idle', self, null, { reason: tag }, 'allowed');
+    return json({ peerId: self, idleAt: new Date().toISOString(), reason: tag });
+  },
+);
+
+// ── §4.10 synapse_recruit ─────────────────────────────────────────
+
+server.registerTool(
+  'synapse_recruit',
+  {
+    title: 'Recruit Idle Peers',
+    description: 'Broadcast a "I need help with X" recruit to idle peers matching capability filters. Idle peers (no row in peer_busy_state) auto-join the named thread on receipt; busy peers may ack-without-commit. The recruit is rate-limited to 5/min per peer; same-description retransmits within 60s are deduped at daemon. Recruit auto-expires per urgency (low=10min / normal=5min / high=2min); on expiry, originator receives a [RECRUIT_EXPIRED] synthetic message with the joined-count.',
+    inputSchema: z.object({
+      description: z.string().describe('What you need help with. Markdown OK.'),
+      capabilities: z.array(z.string()).optional().describe('Required peer capabilities (matches §4.7 caps). Default any-of match.'),
+      requireAll: z.boolean().optional().describe('If true, prospects must have ALL listed capabilities. Default false (any-of).'),
+      excludeCaps: z.array(z.string()).optional().describe('Filter out peers having ANY of these caps.'),
+      threadId: z.string().optional().describe('Existing thread to recruit into. Otherwise mints a fresh thread.'),
+      urgency: z.enum(['low', 'normal', 'high']).optional().describe('Drives expiry TTL. Default "normal".'),
+      originatorBusy: z.boolean().optional().describe('Signals whether you are actively waiting (true, default) or fire-and-forget (false). Prospects sort fire-and-forget recruits lower priority.'),
+      workspace: z.string().optional().describe('Workspace tag for cross-workspace recruit (defaults to caller\'s workspace).'),
+    }),
+  },
+  async ({ description, capabilities, requireAll, excludeCaps, threadId, urgency, originatorBusy, workspace }) => {
+    const from = requireSelf();
+    touchPeer(config, from);
+
+    // Rate limit: 5/min per peer.
+    const recentCount = countRecentRecruits(config, from, 60);
+    if (recentCount >= 5) {
+      bumpCounter('recruit.rate_limit_blocks');
+      recordAudit('synapse_recruit', from, threadId ?? null, { description: description.slice(0, 80) }, 'blocked', `RECRUIT_RATE_LIMIT count=${recentCount}/5min`);
+      throw new Error(`RECRUIT_RATE_LIMIT: ${recentCount} recruits in last 60s (max 5). Try again shortly.`);
+    }
+
+    // Dedup: same description hash within 60s = retransmit, suppress.
+    const descriptionHash = createHash('sha256').update(description).digest('hex').slice(0, 16);
+    const recentDup = findRecentRecruit(config, from, descriptionHash, 60);
+    if (recentDup) {
+      bumpCounter('recruit.dedupe_blocks');
+      recordAudit('synapse_recruit', from, threadId ?? null, { description: description.slice(0, 80), dupOf: recentDup }, 'blocked', 'RECRUIT_DUPLICATE');
+      throw new Error(`RECRUIT_DUPLICATE: identical recruit (${recentDup}) sent within last 60s. Wait or vary the description.`);
+    }
+
+    const recruitId = randomUUID();
+    const tid = threadId ?? randomUUID();
+    const urgencyTag: RecruitUrgency = urgency ?? 'normal';
+    const ttlSec = urgencyTag === 'high' ? 120 : urgencyTag === 'low' ? 600 : 300;
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + ttlSec * 1000).toISOString();
+
+    const recruit: RecruitRow = {
+      id: recruitId,
+      originatorId: from,
+      threadId: tid,
+      description,
+      capabilities: capabilities ?? null,
+      requireAll: requireAll === true,
+      excludeCaps: excludeCaps ?? null,
+      urgency: urgencyTag,
+      originatorBusy: originatorBusy !== false,
+      workspace: workspace ?? null,
+      createdAt: now.toISOString(),
+      expiresAt,
+      fulfilledAt: null,
+      expiredAt: null,
+      descriptionHash,
+    };
+    insertRecruit(config, recruit);
+
+    // Select prospects matching cap filter, excluding originator + busy peers.
+    const prospects = selectRecruitProspects(config, {
+      capabilities,
+      requireAll,
+      excludeCaps,
+      excludeIds: [from],
+      workspace: workspace ?? null,
+    });
+
+    // Originator joins the thread (so they see auto-join replies).
+    joinThread(config, tid, from);
+
+    // Broadcast a [RECRUIT] marker message. Body carries the structured
+    // first line for hook-side parsing + the markdown description.
+    const capsCsv = capabilities ? capabilities.join(',') : '';
+    const urgencyShort = urgencyTag === 'high' ? 'h' : urgencyTag === 'low' ? 'l' : 'n';
+    const markerLine = `[RECRUIT] id=${recruitId} urgency=${urgencyShort} caps=${capsCsv} requireAll=${recruit.requireAll} threadId=${tid} originatorBusy=${recruit.originatorBusy}`;
+    const body = `${markerLine}\n\n${description}`;
+
+    const broadcastId = randomUUID();
+    const broadcast: Message = {
+      id: broadcastId,
+      fromId: from,
+      toId: 'broadcast',
+      threadId: tid,
+      parentId: null,
+      body,
+      workspace: workspace ?? null,
+      createdAt: now.toISOString(),
+      expiresAt,
+      readAt: null,
+    };
+    insertMessage(config, broadcast);
+
+    bumpCounter('recruit.minted');
+    recordAudit('synapse_recruit', from, tid, { recruitId, urgency: urgencyTag, prospectCount: prospects.length }, 'allowed');
+
+    return json({
+      recruitId,
+      threadId: tid,
+      broadcastMessageId: broadcastId,
+      expiresAt,
+      prospects: prospects.map(p => ({ id: p.id, label: p.label, capabilities: p.capabilities })),
+      prospectCount: prospects.length,
+      note: prospects.length === 0
+        ? 'No idle prospects matched the filter. Recruit is still active until TTL; peers that go idle before then will surface it via post-tool-use hook.'
+        : `Broadcast sent to all idle peers; ${prospects.length} match the cap filter. Auto-join behavior fires on prospect side via hooks.`,
     });
   },
 );

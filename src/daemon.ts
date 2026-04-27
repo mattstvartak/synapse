@@ -35,7 +35,39 @@ import { buildIdentityPaths } from './types.js';
 import { createSynapseServer, type SynapseSession } from './server.js';
 import {
   upsertPeer, getPeer, touchPeer,
+  clearAllPeerBusyState, pruneStaleBusyState,
+  expireRecruits, insertMessage,
+  listThreadParticipants,
+  type RecruitRow,
 } from './storage.js';
+import type { Message, SynapseConfig } from './types.js';
+
+// §4.10 — synthetic [RECRUIT_EXPIRED] message emitted when a recruit
+// elapses its TTL without being fulfilled. Lands in the originator's
+// inbox so they know the call for help didn't land. fromId is a marker
+// constant 'daemon-system' which intentionally doesn't match any peer
+// row; pollInbox tolerates missing peer rows via LEFT JOIN.
+function emitRecruitExpiredMessage(config: SynapseConfig, recruit: RecruitRow): void {
+  const participants = listThreadParticipants(config, recruit.threadId);
+  // Exclude originator from the joined count.
+  const joinedCount = Math.max(0, participants.filter(p => p.peerId !== recruit.originatorId).length);
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const body = `[RECRUIT_EXPIRED] id=${recruit.id} joined=${joinedCount}\n\nRecruit "${recruit.description.slice(0, 80)}${recruit.description.length > 80 ? '…' : ''}" expired after ${recruit.urgency} TTL with ${joinedCount === 0 ? 'no' : joinedCount} prospect${joinedCount === 1 ? '' : 's'} joined.`;
+  const msg: Message = {
+    id: randomUUID(),
+    fromId: 'daemon-system',
+    toId: recruit.originatorId,
+    threadId: recruit.threadId,
+    parentId: null,
+    body,
+    workspace: recruit.workspace,
+    createdAt: now,
+    expiresAt,
+    readAt: null,
+  };
+  insertMessage(config, msg);
+}
 import { generateClientId } from './identity.js';
 import { inc as bumpCounter } from './counters.js';
 
@@ -495,6 +527,46 @@ export async function runDaemon(): Promise<void> {
   // despite the shim's identity-token file persisting — failing the "no
   // identity divergence" success criterion.
   loadIdentityBindings(config.dataDir);
+
+  // §4.10 — daemon-restart busy-state sweep. Concurrent-binding restarts
+  // shouldn't leak stale "busy" entries (the peer that owned the busy row
+  // is gone with the prior daemon's in-memory state). Per the agreed
+  // contract: daemon restart = everyone idle.
+  try {
+    const cleared = clearAllPeerBusyState(config);
+    if (cleared > 0) {
+      bumpCounter('busy.startup_swept');
+      process.stderr.write(`synapse-daemon: cleared ${cleared} stale peer_busy_state row(s) on startup\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`synapse-daemon: busy-state sweep failed: ${(err as Error).message}\n`);
+  }
+
+  // §4.10 — periodic GC for busy-state staleness + recruit expiry.
+  // Stale-busy: peers in busy >30min auto-clear (configurable via
+  // SYNAPSE_BUSY_STALE_SEC). Expired recruits: TTL elapsed without
+  // fulfillment → emit synthetic [RECRUIT_EXPIRED] message back to
+  // originator's inbox so they know the recruit didn't land. Both run
+  // on a single 60s timer (cheap SQL ops, no need to split).
+  const RECRUIT_GC_INTERVAL_MS = 60_000;
+  const recruitGcTimer = setInterval(() => {
+    try {
+      const stalePruned = pruneStaleBusyState(config);
+      if (stalePruned > 0) bumpCounter('busy.stale_clears');
+    } catch (err) {
+      process.stderr.write(`synapse-daemon: stale-busy GC failed: ${(err as Error).message}\n`);
+    }
+    try {
+      const expired = expireRecruits(config);
+      for (const r of expired) {
+        emitRecruitExpiredMessage(config, r);
+        bumpCounter('recruit.expired');
+      }
+    } catch (err) {
+      process.stderr.write(`synapse-daemon: recruit-expiry GC failed: ${(err as Error).message}\n`);
+    }
+  }, RECRUIT_GC_INTERVAL_MS);
+  recruitGcTimer.unref?.();
 
   // Reuse existing token if a previous daemon wrote one — clients that
   // saved it are still valid. New token only when daemon.json is absent.
