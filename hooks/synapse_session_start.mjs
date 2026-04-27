@@ -26,7 +26,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -69,6 +69,79 @@ function readStdinJson() {
   }
 }
 
+// §1.7 hook/shim identity unification — read the same identity-token file
+// the shim uses (<dataDir>/<label>-identity.json), probe the daemon via
+// /identity, and surface the canonical peerId. Returns null on any failure
+// (no daemon, dead daemon, network error, parse error). Caller falls back
+// to the legacy hook-bootstrap path when null is returned.
+//
+// Time budget: hard 250ms total. We must never delay session-start
+// beyond what the user can perceive.
+async function resolveIdentityViaDaemon(dataDir, label) {
+  const daemonStatePath = join(dataDir, 'daemon.json');
+  if (!existsSync(daemonStatePath)) return null;
+  let state;
+  try {
+    state = JSON.parse(readFileSync(daemonStatePath, 'utf-8'));
+  } catch {
+    return null;
+  }
+  if (!state || typeof state.port !== 'number' || typeof state.token !== 'string') return null;
+  // Daemon process liveness check — process.kill(pid, 0) returns truthy
+  // (no exception) if the pid exists. If the daemon's pid is dead, skip
+  // probing — the shim's auto-spawn handles fresh-daemon startup, but
+  // hook-side is best-effort and falls back to bootstrap.
+  if (typeof state.pid === 'number' && state.pid > 0) {
+    try { process.kill(state.pid, 0); }
+    catch { return null; }
+  }
+
+  // Read or mint the identity token (same file the shim writes).
+  const identityPath = join(dataDir, `${label}-identity.json`);
+  let identity = null;
+  if (existsSync(identityPath)) {
+    try { identity = JSON.parse(readFileSync(identityPath, 'utf-8')); }
+    catch { /* fall through and mint */ }
+  }
+  if (!identity || typeof identity.identityToken !== 'string') {
+    identity = { identityToken: randomUUID() };
+  }
+
+  // Probe daemon /identity with hard timeout.
+  const url = `http://127.0.0.1:${state.port}/identity`;
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${state.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ label, identityToken: identity.identityToken }),
+      signal: AbortSignal.timeout(250),
+    });
+  } catch {
+    return null;
+  }
+  if (!resp.ok) return null;
+  let payload;
+  try { payload = await resp.json(); }
+  catch { return null; }
+  if (!payload || typeof payload.peerId !== 'string') return null;
+
+  // Persist token + peerId so the shim's later /identity call returns
+  // the same peerId. peerId is informational; daemon's internal Map is
+  // authoritative, but having it on disk makes debugging clearer.
+  try {
+    writeFileSync(identityPath, JSON.stringify({
+      identityToken: identity.identityToken,
+      peerId: payload.peerId,
+    }, null, 2), 'utf-8');
+  } catch { /* best-effort */ }
+
+  return { peerId: payload.peerId, identityToken: identity.identityToken };
+}
+
 const label = parseLabel();
 const dataDir = process.env.SYNAPSE_DATA_DIR ?? join(homedir(), '.claude', 'synapse');
 const peerTimeoutSec = parseInt(process.env.SYNAPSE_PEER_TIMEOUT_SECONDS ?? '600', 10);
@@ -108,15 +181,40 @@ try {
   // storage.ts runs in the MCP server. Idempotent.
   db.exec(INIT_SCHEMA_SQL);
 
-  // Generate ephemeral ID and register.
-  const safeLabel = label.toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 24) || 'client';
-  const selfId = `${safeLabel}-${randomBytes(4).toString('hex')}`;
   const now = new Date().toISOString();
 
-  db.prepare(`
-    INSERT INTO peers (id, label, registered_at, last_seen_at, capabilities)
-    VALUES (?, ?, ?, ?, NULL)
-  `).run(selfId, label, now, now);
+  // §1.7 — prefer identity resolved via daemon. Hook + shim share the
+  // same identity-token file, so when both probe the daemon's /identity,
+  // they get the SAME peerId back. Eliminates the divergence where the
+  // hook bootstrapped peerId A and the shim's later daemon probe minted
+  // peerId B for the same session. Daemon has already inserted/touched
+  // the peer row in resolveIdentity, so the hook doesn't need its own
+  // INSERT in this branch.
+  const daemonIdentity = await resolveIdentityViaDaemon(dataDir, label);
+
+  let selfId;
+  let identitySource;
+  if (daemonIdentity) {
+    selfId = daemonIdentity.peerId;
+    identitySource = 'session-start-hook+daemon';
+    // Touch in case the daemon's resolveIdentity didn't already (it does
+    // on existing-binding hits; on fresh mint the daemon also upserts).
+    db.prepare(`UPDATE peers SET last_seen_at = ? WHERE id = ?`).run(now, selfId);
+  } else {
+    // Fallback: legacy hook-bootstrap path. Daemon was unreachable / no
+    // bindings file / fetch failed. Hook mints a peerId so the session
+    // has SOMETHING; the shim's later daemon probe will produce its own
+    // peerId and overwrite the active file. Identity divergence may
+    // resurface in this branch — but only if the daemon comes up between
+    // hook fire and shim probe, which is unusual.
+    const safeLabel = label.toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 24) || 'client';
+    selfId = `${safeLabel}-${randomBytes(4).toString('hex')}`;
+    identitySource = 'session-start-hook-fallback';
+    db.prepare(`
+      INSERT INTO peers (id, label, registered_at, last_seen_at, capabilities)
+      VALUES (?, ?, ?, ?, NULL)
+    `).run(selfId, label, now, now);
+  }
 
   // Persist active session file (session-keyed) so this Code window's MCP
   // server can adopt the same identity. The legacy ppid-keyed companion
@@ -129,7 +227,7 @@ try {
     registeredAt: now,
     sessionId,
     ppid: PPID,
-    source: 'session-start-hook',
+    source: identitySource,
   }, null, 2);
   writeFileSync(join(dataDir, `active-${label}-${sessionId}.json`), activePayload, 'utf-8');
 

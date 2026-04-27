@@ -27,7 +27,7 @@
 
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { loadConfig } from './config.js';
@@ -92,7 +92,10 @@ function loadIdentityBindings(dataDir: string): void {
   bindingsDataDir = dataDir;
   identityBindings.clear();
   const path = bindingsPath(dataDir);
-  if (!existsSync(path)) return;
+  if (!existsSync(path)) {
+    process.stderr.write(`synapse-daemon: identityBindings.loaded count=0 (no file)\n`);
+    return;
+  }
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, IdentityBinding>;
     for (const [token, binding] of Object.entries(parsed)) {
@@ -103,23 +106,69 @@ function loadIdentityBindings(dataDir: string): void {
         lastUsedAt: binding.lastUsedAt ?? new Date().toISOString(),
       });
     }
+    process.stderr.write(`synapse-daemon: identityBindings.loaded count=${identityBindings.size}\n`);
   } catch (err) {
-    process.stderr.write(`synapse-daemon: failed to load daemon-bindings.json: ${(err as Error).message}\n`);
+    // Degraded mode — start with empty Map and continue serving. Every
+    // shim mints a fresh peerId until the next successful write. This
+    // is the SAME behavior as before §1.6 shipped, so worst-case
+    // regression is "back to v6.0 identity churn until file is rewritten."
+    process.stderr.write(`synapse-daemon: identityBindings.fallback_to_memory reason=${(err as Error).message}\n`);
+    identityBindings.clear();
   }
 }
 
+// Debounced flush — concurrent binds within FLUSH_DEBOUNCE_MS coalesce
+// into a single disk write. Last-write-wins semantics (binds are
+// idempotent at the token level, so a coalesced flush represents the
+// merged state correctly).
+const FLUSH_DEBOUNCE_MS = 200;
+let flushTimer: NodeJS.Timeout | null = null;
+
 function persistIdentityBindings(): void {
+  if (!bindingsDataDir) return;
+  if (flushTimer) clearTimeout(flushTimer);
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    flushIdentityBindingsSync();
+  }, FLUSH_DEBOUNCE_MS);
+  flushTimer.unref?.();
+}
+
+// Synchronous flush — used by the debounced timer AND by exit handlers
+// so a daemon shutdown after a recent bind doesn't drop the write.
+// Atomic: writes to a .tmp sibling and renames into place. renameSync is
+// atomic on POSIX (same filesystem) and on Windows when src+dst are on
+// the same volume — both true here since both paths live in dataDir.
+// Callers from process exit hooks pre-clear flushTimer so the debounced
+// version doesn't double-write the same state.
+function flushIdentityBindingsSync(): void {
   if (!bindingsDataDir) return;
   const obj: Record<string, IdentityBinding> = {};
   for (const [token, binding] of identityBindings) obj[token] = binding;
+  const finalPath = bindingsPath(bindingsDataDir);
+  const tmpPath = `${finalPath}.tmp`;
   try {
     mkdirSync(bindingsDataDir, { recursive: true });
-    writeFileSync(bindingsPath(bindingsDataDir), JSON.stringify(obj, null, 2), 'utf-8');
+    writeFileSync(tmpPath, JSON.stringify(obj, null, 2), 'utf-8');
+    renameSync(tmpPath, finalPath);
   } catch (err) {
-    // Best-effort — never throw inside resolveIdentity. Log and continue
-    // (the binding is still in-memory; next bind will retry the write).
-    process.stderr.write(`synapse-daemon: failed to persist daemon-bindings.json: ${(err as Error).message}\n`);
+    process.stderr.write(`synapse-daemon: identityBindings.write_failed: ${(err as Error).message}\n`);
+    // Best-effort cleanup of the orphan .tmp so the next attempt has a
+    // clean slate. Never throw — the in-memory map is still authoritative.
+    try { if (existsSync(tmpPath)) unlinkSync(tmpPath); }
+    catch { /* nothing to do */ }
   }
+}
+
+// Called from exit handlers (signal handlers + process.on('exit')) so a
+// pending debounced write isn't dropped. Synchronous; safe to call from
+// the synchronous 'exit' event handler. Idempotent.
+function flushPendingBindingsBeforeExit(): void {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  flushIdentityBindingsSync();
 }
 
 // Per-MCP-session transport map. Key = MCP session ID assigned by SDK.
@@ -388,12 +437,23 @@ export async function runDaemon(): Promise<void> {
     process.stderr.write(`synapse-daemon listening on http://${HOST}:${port} (pid ${process.pid})\n`);
   });
 
-  // Graceful shutdown
+  // Graceful shutdown — flush any pending debounced bindings BEFORE the
+  // server-close callback fires so a SIGTERM right after a bind doesn't
+  // lose the write. flushPendingBindingsBeforeExit is synchronous + idempotent.
   const shutdown = (sig: string) => {
     process.stderr.write(`synapse-daemon received ${sig}, exiting\n`);
+    flushPendingBindingsBeforeExit();
     httpServer.close(() => process.exit(0));
     setTimeout(() => process.exit(1), 5000).unref();
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // Catches synapse_request_restart's process.exit(0) and any other
+  // non-signal exit path (e.g. uncaughtException → exit). 'exit' fires
+  // synchronously and is the last hook before the process dies, so
+  // flushPendingBindingsBeforeExit gets one more chance to land state.
+  process.on('exit', () => {
+    flushPendingBindingsBeforeExit();
+  });
 }

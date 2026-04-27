@@ -1,8 +1,9 @@
-# Synapse: Consistency & Production-Readiness Proposal — v6 (Shipped State + Remaining Work)
+# Synapse: Consistency & Production-Readiness Proposal — v6.2
 
 **v5 authors:** cowork-421d7945, code-457b525c
 **v6 authors:** cowork-d40e6e78, code-636bb2b4
-**Date:** 2026-04-26 (v5) → 2026-04-27 (v6 update post-impl)
+**v6.2 authors:** cowork-9b0e0678 (was d40e6e78), code-7e662375 (was b2423c06 → 636bb2b4 → 7e662375 across 4 daemon-restarts; same shim, multiple identities — see §1.6 + §1.7)
+**Date:** 2026-04-26 (v5) → 2026-04-27 (v6 post-impl, v6.2 post-second-design-pass)
 **Frame:** "When it works, it works brilliantly. We just need to make it consistent and production ready." — Matt
 
 This is v6. Section structure preserved from v5 for diff continuity. Each item now carries a status tag: **[SHIPPED commit]** / **[DEFERRED]** / **[NOT STARTED]** / **[NEW]**. New sections (§1.5(d), §1.6, §2.6, §5.4) document what was discovered or shipped beyond the v5 spec.
@@ -74,13 +75,46 @@ Declared client-side feature, not synapse-server work. (a)+(c)+(d) compensate.
 - (c) staleness signal in transport metadata (serverHealth)
 - **(d) ground-truth liveness signal (server-side heartbeat).** Without (d), (a) and (c) trigger on quiet-but-healthy sessions instead of dead ones.
 
-### 1.6 Daemon-restart resets identityBindings — [NEW since v5] [P0 NOT STARTED]
+### 1.6 Daemon-restart resets identityBindings — [NEW since v5] [P0 IN-FLIGHT]
 - **Repro this session:** Three cowork peer-IDs minted by single Matt-side cowork session as daemon was restarted: `cowork-421d7945` → `cowork-685ba225` → `cowork-d40e6e78`. Code-side same daemon = same problem.
+- **Live identity-routing demo (v6.2):** during planner-peer setup, planner's reply arrived `fromId: code-636bb2b4` despite peer being `code-b2423c06`. Either the daemon's identityBindings is munging tokens-to-IDs in real time, OR session routing is collapsing peers under shared shim. Adds a second failure mode beyond the simple restart-resets case.
 - **Root cause located** by code: `src/daemon.ts:74` declares `identityBindings = new Map<string, {peerId, label}>()` as in-memory only. Daemon restart = empty map = no token-to-peerId resolution = each token gets a fresh peerId.
 - **Impact:** This is the bug that gates success-criterion #3. selfId IS consistent within a daemon process; every daemon restart breaks it. With the new daemon mode being the default config, this happens on every code deploy/restart cycle.
-- **Fix sketch from code:** persist `identityBindings` to `<dataDir>/daemon-bindings.json` on every bind; reload on daemon startup. ~30 lines.
-- **Severity recommendation: P0.** Criterion #3 says "no identity divergence" and the criterion is failing right now. 30 lines of code is a low-cost path to actually meeting the bar we set. The alternative is downgrading the criterion to "no identity divergence within a single daemon-process lifetime," which is a meaningfully weaker promise.
-- **Code does the implementation.** Doc only specs the bug + fix shape.
+- **Fix in flight by code-636bb2b4.** Initial sketch: persist `identityBindings` to `<dataDir>/daemon-bindings.json` on every bind; reload on daemon startup. ~30 lines.
+- **CONCURRENCY GAP (v6.2 catch by planner peer):** Multi-shim → one daemon → all writers binding to `daemon-bindings.json`. The 30-line single-writer estimate is incomplete. Spec must include:
+  - **Atomic write** (write-tmp + rename), OR file-lock (fcntl/flock) around bind+flush.
+  - **Parse-fail rollback path:** JSON parse fail / FS error → fall back to in-memory + log warning. Daemon must NOT refuse-start on bindings-file corruption.
+  - **Concurrent-bind ordering:** what happens when two shims bind the same token simultaneously? Document last-write-wins behavior explicitly.
+- **Spec ownership:** planner peer (code-b2423c06) drafting full spec; code-636bb2b4 reviewing and incorporating before final ship.
+- **Severity recommendation: P0.** Criterion #3 says "no identity divergence" and the criterion is failing right now. The alternative is downgrading the criterion to "no identity divergence within a single daemon-process lifetime," which is a meaningfully weaker promise.
+
+---
+
+### 1.7 SessionStart hook + shim identity race — [NEW in v6.2] [P0 NOT STARTED]
+
+**Bug separate from §1.6.** Even with identityBindings persisted (§1.6 fix), there is a race between the SessionStart hook and the shim's daemon probe:
+
+1. SessionStart hook bootstraps peerId A → writes active file with peerId A.
+2. Shim probes daemon for canonical peerId.
+3. Daemon mints peerId B (because the hook's peerId A was never written to the peers table).
+4. Shim overwrites active file with peerId B.
+5. Hook re-reads active file on its next tick, sees B, "self-heals."
+
+**The orphan window:** between steps 1 and 4, any peer that messages "active file's selfId" addresses peerId A. A was never written to peers — message goes to a peer-id that doesn't exist server-side, dropped or orphaned.
+
+**Repro this session:** the planner peer rotated through 4 distinct peer-ids in ~12 minutes. Multiple in-flight messages were silently dropped during the rotation windows (msg `4460fd87` from cowork → planner never arrived; msg `15ce3b4c` from planner → cowork never arrived). Both losses traceable to messages addressed to peer-ids that became ghost-without-record during rotation.
+
+**Fix from planner peer (P0):** SessionStart hook MUST NOT bootstrap independently. Instead:
+1. Shim spawns daemon if absent.
+2. Hook probes `daemon.identity({sessionFingerprint})` for the canonical peerId.
+3. Daemon = single source of truth for peerId-by-token.
+4. Hook's active file always carries the daemon-resolved id — never an independent bootstrap.
+
+**Cross-ref to §1.6:** §1.6 fixes "what does the daemon's identity table look like across restarts." §1.7 fixes "what does the hook + shim agree on for selfId at session-start." Both required to satisfy success-criterion #3.
+
+**Spec ownership:** planner peer (current id `code-7e662375`) drafting full impl spec in stage 1 along with §1.6.
+
+**Companion finding — fan-in identity collapse:** within a single daemon process, multiple distinct peer-id addresses can route to the same shim due to accumulated rebinds. Lived this: messages to `code-636bb2b4` and `code-b2423c06` both reached the same agent because both ids were bound to the same session via the rotation chain. Means peer-id is not a reliable handle for "distinct agent" — only "an address this shim is currently listening on." Doc-only finding; no fix needed if §1.6 + §1.7 prevent the rotation in the first place.
 
 ---
 
@@ -167,12 +201,17 @@ All four sections unchanged from v5. Status: deferred per spec.
 ### 4.6 Thread summarization — [NEW in v6.1] [P2]
 `synapse_summarize_thread({threadId, model?})` — server-side LLM call to compact a long thread to ≤N tokens. Handoff primitive: agent can "catch up" on a thread without re-reading the full history. Requires LLM credentials in the synapse server's environment. Heavy infra; P2 absolutely.
 
-### 4.7 Capability advertisement — [NEW in v6.1] [PROMOTE-CANDIDATE — borderline P1/P2]
-`peers.capabilities` schema field already exists in the peer schema but is never written. Proposal: `synapse_register_capabilities({tags: ["code", "browser", "figma"]})` so senders can route by capability instead of label.
+### 4.7 Capability advertisement — [PROMOTED to P1 in v6.2]
+`peers.capabilities` schema field already exists in the peer schema but is never written. `synapse_register_capabilities({tags: ["code", "browser", "figma", "supports_drafting_signal", "dialect_v0"]})` so senders can route by capability instead of label.
 
-**Why borderline P1:** Lived this tonight. With three active code peers and ghost cowork ids cluttering the peer list, picking the right peer for a routed message is guesswork. Capability tags would resolve "send to a peer with `code` capability" cleanly. Schema change is small; the registration tool is small. Value scales with multi-peer sessions.
+**Why promoted to P1 in v6.2:** Foundation infrastructure — multiple specs depend on it.
 
-**Why kept in §4 instead of P1 right now:** Doesn't gate any v1 success criterion. Ship after the criteria-gating work lands.
+- §5.5(b) provenance gate: `format: "tight"` only emitted to peers with `supports_synapse_disclaimer_in_prompt` capability (otherwise verbose, to preserve untrusted-content framing for harnesses without the system prompt).
+- §5.5 dialect: peers advertise their dialect-version (`dialect_v0`, etc.) so senders know which compression level the receiver can decode.
+- §4.8 drafting: peers advertise `supports_drafting_signal` so senders know whether `peer_drafting` will be reliable.
+- Multi-peer disambiguation: with three+ peers active, capability tags resolve "send to a peer with `impl` capability" cleanly. Lived this tonight.
+
+**Out of §4, into P1.**
 
 ### 4.8 Peer "drafting" presence — [NEW in v6.1] [PROMOTED to P1]
 `synapse_set_drafting({threadId, etaSec?})` → `wait_reply` response includes `peer_drafting: bool` (and `peer_drafting_eta` if provided). Cheap. Avoids burning `wait_reply` timeout cycles when the peer is alive but mid-draft.
@@ -180,6 +219,24 @@ All four sections unchanged from v5. Status: deferred per spec.
 **Why promoted to P1 instead of staying in §4:** Directly addresses a friction we hit live this session. A peer drafting for ~6 minutes (358s gap) is indistinguishable from a dead peer to the waiting side; both present as repeated `wait_reply` timeouts. With `peer_drafting: true`, the waiting agent can extend the wait OR back off without forced timeouts. High value-density, small server change. Pairs with §4.7 work if shipped together.
 
 **Cross-ref:** §3.1 (don't oversell timeout bump), §5.4 (polling cost). §4.8 reduces wait_reply waste from a different angle than §5.4 — by making timeouts informed rather than blind.
+
+**Free §1.2 race-mitigation fold-in (v6.2 NEW):** when `synapse_send(to=X)` fires and `X.peer_drafting=true`, the response includes a `wire_crossing_warning` field signaling the recipient is mid-draft. Zero new infrastructure — leverages the §4.8 plumbing. Closes most of the §1.2 race-condition gap (sender knows to expect a near-miss collision and can hold). Credit: planner peer (code-b2423c06).
+
+**Set-drafting semantics — DECIDED in v6.2: ship both, tag source.** `peer_drafting` payload includes a `source` field: `"voluntary"` when the peer called `synapse_set_drafting()` explicitly, `"implicit"` when the server inferred `peer_drafting=true` from heuristic ("polled within last N sec without subsequent send"). Receiving agents can decide whether to trust implicit signals or only voluntary ones.
+
+**Already shipped in v6.2 stage:** `synapse_set_drafting` and `synapse_clear_drafting` tools landed during the planner-peer disconnect window. Voluntary mode operational. Implicit-source detection follow-up commit per planner peer.
+
+### 4.9 Thread role persistence — [NEW in v6.2 candidate] [P2 / cross-session continuity]
+
+**Problem:** "team" property has a session half-life (per cowork-side meta-pushback to Matt). Within a session, peers self-organize into roles (planner, impl, reviewer, scribe). Across sessions, that organization is lost — a fresh agent joining a thread doesn't know which role they're picking up.
+
+**Proposal from planner peer:** persist a per-peer-per-thread `role` tag in the threads table. Surfaces in `synapse_threads_visible`. New tool `synapse_set_role({threadId, role})` to claim a role; `synapse_get_roles({threadId})` to inspect the thread's role map.
+
+**Effect:** A re-joining agent can introspect: "I'm joining thread X as the impl peer. Current planner is peer Y. Current scribe is peer Z. My job per role is... [convention-defined]." Reduces re-onboarding cost.
+
+**Cross-ref to Cortex/Engram persistence (§5.7):** per-thread roles are one of the thread-state primitives that should be saved to long-term memory at session-end so the next-session agent can pick them up.
+
+**Status:** P2. Defer until §1.6/§1.7 stabilize identity. Roles-without-stable-identity is meaningless.
 
 ---
 
@@ -234,7 +291,7 @@ SSE / WebSocket push. MCP is request-response by design, so this is a heavy lift
 **Goal:** cut peer-message body tokens by 50%+ without losing semantic fidelity.
 
 #### 5.5(a) Glossary expansion — [SHIP NOW] [convention only, free]
-Extend the §5.3.a glossary in README from `ACK / DIFF / NEW / §X.Y / P0-2 / + / → / ? / !` to include:
+Extend the §5.3.a glossary in README from `ACK / DIFF / NEW / §X.Y / P0-2 / + / → / ? / !` to include 6 new glyphs:
 
 - `~` tentative
 - `>>` see-also
@@ -242,10 +299,8 @@ Extend the §5.3.a glossary in README from `ACK / DIFF / NEW / §X.Y / P0-2 / + 
 - `||` or-alt
 - `==` equivalent
 - `<>` differ
-- `^` confirm-prior
-- `*` mark-followup
 
-Stop at 12-15 total glyphs to avoid comprehension drift. Token cost: free. README update only.
+**Trimmed in v6.2** (planner peer caught budget violation): dropped `^` (confirm-prior, redundant with `ACK`) and `*` (mark-followup, redundant with `?`). Net total: 9 existing + 6 new = 15 glyphs. Stays within the doc's stated 12-15 cap. Token cost: free. README update only.
 
 #### 5.5(b) `format: "tight"` flag on `synapse_send` — [P1, server + hook change]
 Sender opts in. Recipient's `UserPromptSubmit` hook surfaces with a stripped wrapper:
