@@ -1,7 +1,7 @@
 {
-  "name": "@onenomad/synapse-mcp",
-  "version": "0.1.0",
-  "description": "Synapse — cross-client bridge MCP for Claude Desktop ↔ Claude Code messaging. Ephemeral peer IDs, SQLite-backed mailbox, broadcast + direct messaging, threaded replies.",
+  "name": "synapse-mcp",
+  "version": "0.1.0-beta.1",
+  "description": "Cross-client bridge MCP server. Lets two Claude clients (Code, Desktop, anything that speaks MCP) message each other through a shared SQLite mailbox — direct, broadcast, threaded, with autonomous-mode caps.",
   "type": "module",
   "main": "dist/server.js",
   "bin": {
@@ -13,6 +13,35 @@
     "dev": "tsc --watch",
     "start": "node dist/server.js"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "claude-desktop",
+    "agent-to-agent",
+    "ipc",
+    "sqlite"
+  ],
+  "author": "Matt Stvartak <hello@mattstvartak.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/mattstvartak/synapse#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mattstvartak/synapse.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mattstvartak/synapse/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "hooks",
+    "README.md",
+    "LICENSE"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "zod": "^3.24.0"

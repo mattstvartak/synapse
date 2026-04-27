@@ -2,7 +2,9 @@
 
 Cross-client bridge MCP server. Two Claude clients (Code, Desktop, Cowork — anything that speaks MCP) talk to each other through a shared SQLite mailbox: direct messaging, broadcast, threaded replies, autonomous-mode turn caps, and a SessionStart hook that handles identity adoption automatically.
 
-**Status:** v0.1.0 — usable but actively iterating. See `outputs/synapse-pr-readiness-proposal.md` for the production-readiness spec and roadmap.
+**Status:** v0.1.0 — usable but actively iterating. MIT licensed. See `outputs/synapse-pr-readiness-proposal.md` for the production-readiness spec and roadmap.
+
+**Requirements:** Node.js 20+, an MCP-capable Claude client (Claude Code, Claude Desktop, or anything else that speaks stdio MCP). Local-only — no network transport. Tested on Windows; should work on macOS/Linux but path examples below are Windows-style.
 
 ## Why
 
@@ -15,6 +17,21 @@ Useful when:
 - Building agent-to-agent workflows where each agent has a different model, tool surface, or persona.
 
 Not useful for cross-machine coordination — synapse is intentionally local-only (filesystem + SQLite). If you need machines to talk, run synapse on a shared mount or build a remote transport.
+
+## Quickstart
+
+1. Clone and build:
+   ```bash
+   git clone https://github.com/mattstvartak/synapse.git
+   cd synapse
+   npm install
+   npm run build
+   ```
+2. Wire one MCP client (start with Claude Desktop — fewer moving parts than Code's hooks). Point its config at `dist/cli.js shim` with `SYNAPSE_LABEL=desktop` (config blocks below).
+3. Wire a second client with a different label (e.g. `code` or another Desktop instance with `desktop2`).
+4. In one client, call `synapse_peers` — you should see the other one. Then `synapse_send({ to: "<peerId>", body: "hello" })` and watch it land on the other side.
+
+That's the whole runtime. Everything else in this README is depth: hooks (Code-only, optional but nice), autonomous-mode caps, audit trail, troubleshooting.
 
 ## Install
 
@@ -62,6 +79,8 @@ Hooks wire separately under `~/.claude/settings.json`:
 ```
 
 The `--label=code` argv is the *default*. To run a single Claude Code window under a different label (e.g. `cowork`), set `SYNAPSE_LABEL=cowork` in that window's environment **before** launching `claude`. Env beats argv — see [Identity & label resolution](#identity--label-resolution).
+
+> **Heads up:** `~/.claude/settings.json` is *global* — these hooks fire for every Claude Code project, not just this repo. That's intentional (you usually want your peer presence everywhere), but if you only want synapse on certain projects, put the hook block in a per-project `.claude/settings.json` instead. Hook commands need absolute paths either way; Claude Code does NOT expand `~`.
 
 ### Claude Desktop (`%APPDATA%\Claude\claude_desktop_config.json`)
 
@@ -344,6 +363,12 @@ Confirm `~/.claude/settings.json` has the hook entries with absolute paths (Clau
 
 Production-readiness proposal — success criteria, P0/P1/P2 list, design questions: **`outputs/synapse-pr-readiness-proposal.md`**. The doc is co-authored by two Claude sessions during a real cross-client brainstorm; it's the canonical statement of where synapse is going. If anything in this README contradicts that doc, the doc wins.
 
+## Contributing
+
+Issues and PRs welcome at [github.com/mattstvartak/synapse](https://github.com/mattstvartak/synapse). See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for dev setup, test commands, and PR conventions. The roadmap and design rationale live in `outputs/synapse-pr-readiness-proposal.md`; check that doc before proposing larger changes so we're not duplicating planned work.
+
+This project follows the [Contributor Covenant](https://www.contributor-covenant.org/version/2/1/code_of_conduct/) code of conduct. Report unacceptable behavior to hello@mattstvartak.com.
+
 ## License
 
-(Internal OneNomad project — no public license at this time.)
+[MIT](./LICENSE) © Matt Stvartak.
